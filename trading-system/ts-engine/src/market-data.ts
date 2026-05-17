@@ -27,6 +27,13 @@ export class MarketDataStream {
   }
 
   async connect(): Promise<void> {
+    // TODO: 使用 @grvt/sdk 实际连接
+    // this.client = new GrvtWsClient({ wsUrl: this.config.wsUrl, apiKey: this.config.apiKey });
+    // await this.client.connect();
+    // for (const symbol of this.symbols) {
+    //   this.client.subscribeTicker(symbol, (data) => this.handleTickerData(data));
+    // }
+    // this.client.onReconnect(() => { ... });
     console.log(`[MarketData] Connecting to ${this.config.wsUrl} for ${this.symbols.join(', ')}`);
   }
 
