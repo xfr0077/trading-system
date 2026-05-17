@@ -1,0 +1,30 @@
+version: '3.8'
+
+services:
+  ts-engine:
+    build: ./ts-engine
+    ports:
+      - "50051:50051"
+    environment:
+      - GRVT_API_KEY=${GRVT_API_KEY}
+      - GRVT_ENV=${GRVT_ENV:-testnet}
+      - REDIS_URL=redis://redis:6379
+      - SQLITE_PATH=/data/trades.db
+      - TAILSCALE_AI_IP=${TAILSCALE_AI_IP}
+    volumes:
+      - ./data:/data
+    depends_on:
+      - redis
+    restart: always
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    command: redis-server --maxmemory 512mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    restart: always
+
+volumes:
+  redis_data:
