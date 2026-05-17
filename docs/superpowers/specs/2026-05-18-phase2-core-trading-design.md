@@ -312,20 +312,27 @@ class AIConfig(BaseModel):
 
 - 消费 Redis Streams `market:{symbol}`
 - 使用 `XREAD` 阻塞读取（`BLOCK 5000`）
-- **断线重连策略：** 重连后从当前最新条目开始消费（`XREAD ... $`），**跳过历史堆积数据**，不追赶旧行情
+- **断线重连策略（跳尾机制）：**
+  1. `XREAD` 读取到数据后，检查最新一条消息的时间戳
+  2. 如果 `now() - latest_message.timestamp > 1000ms`，说明积压严重（刚从断线恢复）
+  3. 放弃当前批数据，将 `XREAD` 的起始 ID 强制重置为 `$`（跳到流尾部）
+  4. 如果积压 < 1 秒，正常消费这批数据
 - 将行情数据转换为特征工程输入格式
 
 ```python
 class RedisMarketReader:
+    _BACKLOG_THRESHOLD_MS = 1000  # 积压阈值：超过 1 秒则跳尾
+
     def __init__(self, redis_url: str, symbols: list[str]):
         ...
     
     async def stream(self) -> AsyncIterator[MarketData]:
-        """持续产出行情数据。断线重连后从最新数据开始，跳过历史堆积。"""
+        """持续产出行情数据。断线重连后自动检测积压程度，
+        超过阈值则跳到流尾部（$），确保 AI 只基于最新行情推理。"""
         ...
 ```
 
-> **设计理由：** Tailscale 跨地域连接可能抖动。如果断线 30 秒后重连，Redis 中可能堆积数百条旧行情。追赶消费会导致 AI 对过期数据产生信号，浪费 CPU 算力并增加 gRPC 通信延迟。跳过历史数据确保 AI 始终基于最新行情做决策。
+> **设计理由：** Tailscale 跨地域连接可能抖动。小断线（<1s）正常消费无影响；大断线（>1s）如果追赶消费旧行情，AI 会对过期数据产生信号，浪费 CPU 算力并增加 gRPC 通信延迟。跳尾机制确保 AI 始终基于最新行情做决策。
 
 #### 2.5.3 特征工程 (`feature_engine.py`)
 
