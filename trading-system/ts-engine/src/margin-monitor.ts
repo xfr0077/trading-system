@@ -1,11 +1,4 @@
-export interface MarginStatus {
-  totalEquity: number;
-  availableMargin: number;
-  usedMargin: number;
-  marginRatio: number;
-  status: 'normal' | 'warning' | 'critical';
-  updatedAt: number;
-}
+import { MarginStatus } from './types';
 
 export interface MarginMonitorConfig {
   warningThreshold: number;
@@ -18,10 +11,18 @@ export class MarginMonitor {
 
   constructor(private config: MarginMonitorConfig) {}
 
-  updateStatus(status: MarginStatus): void {
-    this.status = status;
+  updateStatus(raw: Omit<MarginStatus, 'status'>): void {
+    const computedStatus: MarginStatus = {
+      ...raw,
+      status: raw.marginRatio >= this.config.criticalThreshold
+        ? 'critical'
+        : raw.marginRatio >= this.config.warningThreshold
+          ? 'warning'
+          : 'normal',
+    };
+    this.status = computedStatus;
     for (const cb of this.callbacks) {
-      cb(status);
+      cb(computedStatus);
     }
   }
 
