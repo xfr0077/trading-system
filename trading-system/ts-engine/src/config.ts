@@ -1,13 +1,15 @@
+import { GrvtEnv } from '@wezzcoetzee/grvt';
+
 export interface Config {
   grvtApiKey: string;
-  grvtEnv: 'testnet' | 'prod';
+  grvtPrivateKey: string;
+  grvtTradingAccountId: string;
+  grvtEnv: GrvtEnv;
   redisUrl: string;
   sqlitePath: string;
   grpcPort: number;
   tailscaleAiIp: string;
-  grvtMarketDataWsUrl: string;
-  grvtTradingWsUrl: string;
-  grvtRestApiUrl: string;
+  symbols: string[];
   maxPositionSize: number;
   maxDailyLoss: number;
   maxConcurrentSignals: number;
@@ -50,10 +52,15 @@ export function loadConfig(): Config {
   const grvtApiKey = process.env.GRVT_API_KEY;
   if (!grvtApiKey) throw new Error('GRVT_API_KEY is required');
 
-  const grvtEnv = process.env.GRVT_ENV;
-  if (grvtEnv !== undefined && grvtEnv !== 'testnet' && grvtEnv !== 'prod') {
-    throw new Error('GRVT_ENV must be testnet or prod');
-  }
+  const grvtPrivateKey = process.env.GRVT_PRIVATE_KEY;
+  if (!grvtPrivateKey) throw new Error('GRVT_PRIVATE_KEY is required');
+
+  const grvtTradingAccountId = process.env.GRVT_TRADING_ACCOUNT_ID || '';
+
+  const grvtEnvRaw = process.env.GRVT_ENV || 'testnet';
+  const grvtEnv = mapGrvtEnvironment(grvtEnvRaw);
+
+  const symbols = (process.env.SYMBOLS || 'BTC_USDT_Perp,ETH_USDT_Perp').split(',').map(s => s.trim());
 
   const port = parseInt(process.env.GRPC_PORT || '50051', 10);
   if (isNaN(port) || port < 1 || port > 65535) {
@@ -94,41 +101,34 @@ export function loadConfig(): Config {
     throw new Error('MARGIN_WARNING_THRESHOLD must be less than MARGIN_CRITICAL_THRESHOLD');
   }
 
-  const grvtMarketDataWsUrl = validateUrl(
-    process.env.GRVT_MARKET_DATA_WS_URL || 'wss://market-data.dev.gravitymarkets.io/ws',
-    'GRVT_MARKET_DATA_WS_URL',
-    ['wss://', 'https://']
-  );
-
-  const grvtTradingWsUrl = validateUrl(
-    process.env.GRVT_TRADING_WS_URL || 'wss://trades.dev.gravitymarkets.io/ws',
-    'GRVT_TRADING_WS_URL',
-    ['wss://', 'https://']
-  );
-
-  const grvtRestApiUrl = validateUrl(
-    process.env.GRVT_REST_API_URL || 'https://api.dev.gravitymarkets.io',
-    'GRVT_REST_API_URL',
-    ['https://']
-  );
-
   return {
     grvtApiKey,
-    grvtEnv: grvtEnv || 'testnet',
+    grvtPrivateKey,
+    grvtTradingAccountId,
+    grvtEnv,
     redisUrl: process.env.REDIS_URL || 'redis://localhost:6379',
     sqlitePath: process.env.SQLITE_PATH || '/data/trades.db',
     grpcPort: port,
     tailscaleAiIp: process.env.TAILSCALE_AI_IP || '127.0.0.1',
-    grvtMarketDataWsUrl,
-    grvtTradingWsUrl,
-    grvtRestApiUrl,
+    symbols,
     maxPositionSize,
     maxDailyLoss,
     maxConcurrentSignals: parseInt(process.env.MAX_CONCURRENT_SIGNALS || '3', 10),
     minConfidence: minConfidenceRaw,
     maxPriceDeviationPct,
-    signalTtlMs: parseInt(process.env.SIGNAL_TTL_MS || '30000', 10),
+    signalTtlMs: parseInt(process.env.SIGNAL_TTL_MS || '300000', 10),
     marginWarningThreshold,
     marginCriticalThreshold,
   };
+}
+
+function mapGrvtEnvironment(env: string): GrvtEnv {
+  const map: Record<string, GrvtEnv> = {
+    'testnet': GrvtEnv.TESTNET,
+    'prod': GrvtEnv.PROD,
+    'production': GrvtEnv.PROD,
+    'staging': GrvtEnv.STG,
+    'dev': GrvtEnv.DEV,
+  };
+  return map[env.toLowerCase()] || GrvtEnv.TESTNET;
 }

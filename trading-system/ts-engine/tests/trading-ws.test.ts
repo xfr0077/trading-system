@@ -43,6 +43,6 @@ describe('TradingWebSocket', () => {
   });
 
   test('should connect without error', async () => {
-    await expect(ws.connect({ tradingWsUrl: 'wss://test.grvt.io', apiKey: 'test-key' })).resolves.not.toThrow();
+    await expect(ws.connect({ tradingWsUrl: 'wss://test.grvt.io', apiKey: 'test-key', apiSecret: '0xtest' })).resolves.not.toThrow();
   });
 });

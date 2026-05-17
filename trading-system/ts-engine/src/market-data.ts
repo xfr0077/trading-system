@@ -1,4 +1,5 @@
 import Redis from 'ioredis';
+import { GrvtRawClient, GrvtEnv, WebSocketTransport, buildTickerFeed } from '@wezzcoetzee/grvt';
 
 export interface MarketData {
   symbol: string;
@@ -9,36 +10,85 @@ export interface MarketData {
   timestamp: number;
 }
 
-export interface GrvtConfig {
-  wsUrl: string;
+export interface MarketDataConfig {
   apiKey: string;
+  env: GrvtEnv;
+  symbols: string[];
 }
 
 export class MarketDataStream {
   private redis: Redis;
-  private symbols: string[];
-  private config: GrvtConfig;
+  private rawClient: GrvtRawClient | null = null;
+  private ws: WebSocketTransport | null = null;
+  private config: MarketDataConfig;
   private latestPrices = new Map<string, MarketData>();
+  private reconnectAttempts = 0;
+  private maxReconnectAttempts = 10;
+  private reconnectTimer: NodeJS.Timeout | null = null;
 
-  constructor(config: GrvtConfig, redis: Redis, symbols: string[]) {
+  constructor(config: MarketDataConfig, redis: Redis) {
     this.config = config;
     this.redis = redis;
-    this.symbols = symbols;
   }
 
   async connect(): Promise<void> {
-    // TODO: 使用 @grvt/sdk 实际连接
-    // this.client = new GrvtWsClient({ wsUrl: this.config.wsUrl, apiKey: this.config.apiKey });
-    // await this.client.connect();
-    // for (const symbol of this.symbols) {
-    //   this.client.subscribeTicker(symbol, (data) => this.handleTickerData(data));
-    // }
-    // this.client.onReconnect(() => { ... });
-    console.log(`[MarketData] Connecting to ${this.config.wsUrl} for ${this.symbols.join(', ')}`);
+    // 初始化 RawClient（用于 REST 查询）
+    this.rawClient = new GrvtRawClient({
+      env: this.config.env,
+      apiKey: this.config.apiKey,
+    });
+
+    // 初始化 WebSocket（实时行情推送）
+    try {
+      this.ws = new WebSocketTransport({
+        env: this.config.env,
+      });
+      await this.ws.ready();
+
+      this.ws.onClose(() => {
+        console.log('[MarketData] WebSocket closed, scheduling reconnect');
+        this.scheduleReconnect();
+      });
+
+      this.subscribeToTickers();
+
+      console.log('[MarketData] Connected');
+    } catch (err) {
+      console.error('[MarketData] WebSocket connection failed:', err);
+    }
   }
 
-  async disconnect(): Promise<void> {
-    this.redis.disconnect();
+  private subscribeToTickers(): void {
+    if (!this.ws) return;
+
+    for (const symbol of this.config.symbols) {
+      // 订阅 Ticker 推送
+      this.ws.subscribe(
+        'ticker.s',
+        buildTickerFeed(symbol, '500'),
+        (data: any) => {
+          this.handleTickerData(data);
+        }
+      );
+    }
+
+    console.log(`[MarketData] Subscribed to tickers: ${this.config.symbols.join(', ')}`);
+  }
+
+  private scheduleReconnect(): void {
+    if (this.reconnectAttempts >= this.maxReconnectAttempts) {
+      console.error('[MarketData] Max reconnect attempts reached');
+      return;
+    }
+    const delay = Math.min(1000 * Math.pow(2, this.reconnectAttempts), 30000);
+    this.reconnectAttempts++;
+    this.reconnectTimer = setTimeout(async () => {
+      try {
+        await this.connect();
+      } catch (err) {
+        this.scheduleReconnect();
+      }
+    }, delay);
   }
 
   handleTickerData(rawData: any): void {
@@ -49,12 +99,12 @@ export class MarketDataStream {
 
   parseTickerData(raw: any): MarketData {
     return {
-      symbol: raw.symbol,
-      lastPrice: parseFloat(raw.last_price),
-      bidPrice: parseFloat(raw.bid_price),
-      askPrice: parseFloat(raw.ask_price),
-      volume24h: parseFloat(raw.volume_24h || '0'),
-      timestamp: Math.floor(parseInt(raw.event_time, 10) / 1_000_000),
+      symbol: raw.instrument || 'UNKNOWN',
+      lastPrice: parseFloat(raw.last_price || '0'),
+      bidPrice: parseFloat(raw.best_bid_price || '0'),
+      askPrice: parseFloat(raw.best_ask_price || '0'),
+      volume24h: parseFloat(raw.volume_24h || raw.volume || '0'),
+      timestamp: raw.event_time ? Math.floor(parseInt(raw.event_time, 10) / 1_000_000) : Date.now(),
     };
   }
 
@@ -84,5 +134,17 @@ export class MarketDataStream {
 
   getLatestPriceInMemory(symbol: string): MarketData | null {
     return this.latestPrices.get(symbol) || null;
+  }
+
+  async disconnect(): Promise<void> {
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    if (this.ws) {
+      await this.ws.close().catch(() => {});
+      this.ws = null;
+    }
+    this.redis.disconnect();
   }
 }

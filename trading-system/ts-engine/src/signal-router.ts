@@ -9,6 +9,7 @@ import { Config } from './config';
 import { SqliteStore, Order } from './sqlite-store';
 import { OrderTimeoutManager } from './order-timeout-manager';
 import { TradingWebSocket, GrvtConfig } from './trading-ws';
+import { GrvtEnv } from '@wezzcoetzee/grvt';
 import { OrderUpdate } from './types';
 import { ISignalQueue, DefaultSignalQueue } from './signal-queue';
 
@@ -107,9 +108,22 @@ export class SignalRouter {
 
     // 连接 TradingWS
     await this.tradingWs.connect({
-      tradingWsUrl: this.config.grvtTradingWsUrl,
       apiKey: this.config.grvtApiKey,
+      privateKey: this.config.grvtPrivateKey,
+      tradingAccountId: this.config.grvtTradingAccountId,
+      env: this.config.grvtEnv,
     });
+  }
+
+  async initializeMarketData(redis: any): Promise<void> {
+    const { MarketDataStream } = await import('./market-data');
+    this.marketData = new MarketDataStream({
+      apiKey: this.config.grvtApiKey,
+      apiSecret: this.config.grvtApiSecret,
+      env: this.config.grvtEnv,
+      symbols: this.config.symbols,
+    }, redis);
+    await this.marketData.connect();
   }
 
   setMarketData(stream: MarketDataStream): void {

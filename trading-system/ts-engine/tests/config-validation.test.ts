@@ -6,13 +6,13 @@ describe('Config Phase 2 - Validation & Defaults', () => {
   beforeEach(() => {
     process.env = { ...originalEnv };
     process.env.GRVT_API_KEY = 'test-key';
+    process.env.GRVT_PRIVATE_KEY = '0xtest-secret';
   });
 
   afterEach(() => {
     process.env = { ...originalEnv };
   });
 
-  // Issue 1: 缺少风控参数默认值测试
   describe('risk parameter defaults', () => {
     test('should use default maxPositionSize of 0.1 when not set', () => {
       delete process.env.MAX_POSITION_SIZE;
@@ -51,7 +51,6 @@ describe('Config Phase 2 - Validation & Defaults', () => {
     });
   });
 
-  // Issue 2: 缺少边界值验证
   describe('risk parameter boundary validation', () => {
     test('should throw if MAX_POSITION_SIZE is negative', () => {
       process.env.MAX_POSITION_SIZE = '-1';
@@ -84,7 +83,6 @@ describe('Config Phase 2 - Validation & Defaults', () => {
     });
   });
 
-  // Issue 3: marginWarningThreshold 与 marginCriticalThreshold 无逻辑校验
   describe('margin threshold logical validation', () => {
     test('should throw if marginWarningThreshold is greater than marginCriticalThreshold', () => {
       process.env.MARGIN_WARNING_THRESHOLD = '0.95';
@@ -107,31 +105,17 @@ describe('Config Phase 2 - Validation & Defaults', () => {
     });
   });
 
-  // Issue 4: WebSocket URL 无格式校验
-  describe('WebSocket URL format validation', () => {
-    test('should throw if GRVT_MARKET_DATA_WS_URL does not start with wss:// or https://', () => {
-      process.env.GRVT_MARKET_DATA_WS_URL = 'ftp://invalid-url';
-      expect(() => loadConfig()).toThrow('GRVT_MARKET_DATA_WS_URL must start with wss:// or https://');
-    });
-
-    test('should throw if GRVT_TRADING_WS_URL does not start with wss:// or https://', () => {
-      process.env.GRVT_TRADING_WS_URL = 'ws://insecure-url';
-      expect(() => loadConfig()).toThrow('GRVT_TRADING_WS_URL must start with wss:// or https://');
-    });
-
-    test('should throw if GRVT_REST_API_URL does not start with https://', () => {
-      process.env.GRVT_REST_API_URL = 'http://insecure-api';
-      expect(() => loadConfig()).toThrow('GRVT_REST_API_URL must start with https://');
-    });
-
-    test('should accept valid wss:// URLs', () => {
-      process.env.GRVT_MARKET_DATA_WS_URL = 'wss://valid.url/ws';
-      process.env.GRVT_TRADING_WS_URL = 'wss://valid.url/ws';
-      process.env.GRVT_REST_API_URL = 'https://valid.api';
+  describe('environment validation', () => {
+    test('should default to testnet for invalid env', () => {
+      process.env.GRVT_ENV = 'invalid';
       const config = loadConfig();
-      expect(config.grvtMarketDataWsUrl).toBe('wss://valid.url/ws');
-      expect(config.grvtTradingWsUrl).toBe('wss://valid.url/ws');
-      expect(config.grvtRestApiUrl).toBe('https://valid.api');
+      expect(config.grvtEnv).toBe('testnet');
+    });
+
+    test('should accept testnet', () => {
+      process.env.GRVT_ENV = 'testnet';
+      const config = loadConfig();
+      expect(config.grvtEnv).toBe('testnet');
     });
   });
 });

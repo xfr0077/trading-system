@@ -13,6 +13,7 @@
     "@grpc/grpc-js": "^1.10.0",
     "@grpc/proto-loader": "^0.7.0",
     "@grvt/sdk": "^0.1.0",
+    "@wezzcoetzee/grvt": "^0.1.0",
     "better-sqlite3": "^9.6.0",
     "ioredis": "^5.3.0",
     "pino": "^8.19.0",

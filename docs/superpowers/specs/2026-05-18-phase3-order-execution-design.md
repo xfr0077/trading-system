@@ -78,10 +78,32 @@
 - GRVT API 交互时使用字符串格式（如 `String(order.limitPrice)`）
 - 仅在展示/日志时转换为数字
 
-**5. Docker WAL 部署注意**
-- `docker-compose.yml` 中 `/data` 目录必须挂载为命名 Volume（如 `./data:/data`）
-- WAL 模式会生成 `-wal` 和 `-shm` 伴随文件，需确保挂载路径权限正确
-- 容器重启时 SQLite 自动恢复 WAL 文件，无需额外处理
+**5. 优雅停机 (Graceful Shutdown)**
+- 监听 `SIGTERM` 和 `SIGINT` 信号
+- 停机顺序：
+  1. 停止接收新的 gRPC 信号（关闭 gRPC server）
+  2. 清理 `OrderTimeoutManager` 中的所有内存定时器
+  3. 平滑断开 GRVT WebSocket 连接（TradingWS + MarketDataWS）
+  4. 执行 `db.pragma('wal_checkpoint(TRUNCATE)')` 确保 WAL 日志完全写入
+  5. 正常关闭 SQLite 连接
+- 这样能大大减轻下一次"启动恢复"时的同步压力
+
+**6. 重连拉取状态的并发优化**
+- 如果 GRVT API 支持 `GET /api/v1/orders?status=open`，一次性拉取所有活跃订单
+- 在内存中与 SQLite 的结果进行 Diff 比对，效率远高于串行 `for...of` 请求
+- 如果只能单个查询，使用 `Promise.all` 配合并发限制（如 `p-limit`）进行批量查询
+
+**7. 科学计数法陷阱防护**
+- JS 原生的 `String(0.0000001)` 或 `decimal.js` 的 `toString()` 可能输出科学计数法（如 `"1e-7"`）
+- GRVT API 只接受普通数字字符串，科学计数法会报错
+- 在发送给交易所的映射函数中，统一使用 `decimalObj.toFixed()` 强制禁止科学计数法
+- 示例：`new Decimal('0.0000001').toFixed()` → `"0.0000001"`（而非 `"1e-7"`）
+
+**8. WAL 文件膨胀管理**
+- 高频交易写入下，`-wal` 文件可能持续膨胀占用磁盘
+- `better-sqlite3` 默认会触发自动 Checkpoint，但极端情况下可能滞后
+- 在启动阶段显式执行一次 `db.pragma('wal_checkpoint(TRUNCATE)')`
+- 可选：添加定时任务（如每天交易清淡时段）定期执行 checkpoint
 
 ---
 
