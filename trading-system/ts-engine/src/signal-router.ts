@@ -6,6 +6,11 @@ import { MarginMonitor } from './margin-monitor';
 import { MarketDataStream } from './market-data';
 import { OrderManager } from './order-manager';
 import { Config } from './config';
+import { SqliteStore, Order } from './sqlite-store';
+import { OrderTimeoutManager } from './order-timeout-manager';
+import { TradingWebSocket, GrvtConfig } from './trading-ws';
+import { OrderUpdate } from './types';
+import { ISignalQueue, DefaultSignalQueue } from './signal-queue';
 
 const protoPath = path.join(__dirname, '../../proto/signal.proto');
 const protoDefinition = loadSync(protoPath);
@@ -39,6 +44,8 @@ interface SignalInput {
   maxSlippageBps: number;
 }
 
+export { SignalInput };
+
 export class SignalRouter {
   private seenSignals = new Map<string, number>();
   private readonly TTL_MS = 5 * 60 * 1000;
@@ -47,8 +54,14 @@ export class SignalRouter {
   private marginMonitor: MarginMonitor;
   private marketData: MarketDataStream | null = null;
   private orderManager: OrderManager;
+  private sqliteStore: SqliteStore;
+  private timeoutManager: OrderTimeoutManager;
+  private tradingWs: TradingWebSocket;
+  private signalQueue: ISignalQueue;
+  private config: Config;
 
   constructor(config: Config) {
+    this.config = config;
     this.cleanupInterval = setInterval(() => this.cleanupExpiredSignals(), 60 * 1000);
     this.cleanupInterval.unref();
 
@@ -66,6 +79,37 @@ export class SignalRouter {
       criticalThreshold: config.marginCriticalThreshold,
     });
     this.orderManager = new OrderManager();
+    this.sqliteStore = new SqliteStore(config.sqlitePath);
+    this.timeoutManager = new OrderTimeoutManager();
+    this.tradingWs = new TradingWebSocket();
+    this.signalQueue = new DefaultSignalQueue();
+
+    this.tradingWs.onOrderUpdate((update) => this.handleOrderUpdate(update));
+  }
+
+  async initialize(): Promise<void> {
+    // 重启恢复：从数据库恢复未完成订单的定时器
+    const openOrders = this.sqliteStore.getOpenOrders();
+    await this.timeoutManager.restoreFromDatabase(openOrders, async (orderId, remainingMs) => {
+      this.timeoutManager.schedule(orderId, remainingMs, async () => {
+        const order = this.sqliteStore.getOrder(orderId);
+        if (order && order.status === 'submitted') {
+          await this.tradingWs.cancelOrder(order.orderId);
+          this.orderManager.updateStatus(orderId, 'cancelled');
+          order.status = 'cancelled';
+          order.updatedAt = Date.now();
+          this.sqliteStore.saveOrder(order);
+          this.riskEngine.updateShadowPosition(order.symbol, 0);
+        }
+      });
+    });
+    console.log(`[SignalRouter] Restored ${openOrders.length} pending orders from database`);
+
+    // 连接 TradingWS
+    await this.tradingWs.connect({
+      tradingWsUrl: this.config.grvtTradingWsUrl,
+      apiKey: this.config.grvtApiKey,
+    });
   }
 
   setMarketData(stream: MarketDataStream): void {
@@ -159,29 +203,124 @@ export class SignalRouter {
       return { accepted: false, reason: riskResult.reason };
     }
 
+    // 通过队列（默认直接通过）
+    const processedSignal = await this.signalQueue.enqueue(signal);
+
+    // 去重检查
     const now = Date.now();
-    const lastSeen = this.seenSignals.get(signal.signalId);
+    const lastSeen = this.seenSignals.get(processedSignal.signalId);
     if (lastSeen && now - lastSeen < this.TTL_MS) {
       return { accepted: false, reason: 'DUPLICATE_SIGNAL' };
     }
 
-    this.seenSignals.set(signal.signalId, now);
+    this.seenSignals.set(processedSignal.signalId, now);
 
+    // 创建订单
     const order = this.orderManager.createOrder({
-      signalId: signal.signalId,
-      symbol: signal.symbol,
-      side: signal.action === 'long' ? 'buy' : signal.action === 'short' ? 'sell' : 'buy',
-      size: signal.positionSize,
-      limitPrice: signal.signalPrice,
-      stopLoss: signal.stopLoss,
-      takeProfit: signal.takeProfit,
+      signalId: processedSignal.signalId,
+      symbol: processedSignal.symbol,
+      side: processedSignal.action === 'long' ? 'buy' : 'sell',
+      size: processedSignal.positionSize,
+      limitPrice: processedSignal.signalPrice,
+      stopLoss: processedSignal.stopLoss,
+      takeProfit: processedSignal.takeProfit,
+    });
+
+    // 提交到 GRVT
+    const ttlMs = this.config.signalTtlMs;
+    const expiresAt = Date.now() + ttlMs;
+    const orderForSubmit: Order = {
+      clientOrderId: order.clientOrderId,
+      orderId: '',
+      signalId: order.signalId,
+      symbol: order.symbol,
+      side: order.side,
+      size: String(order.size),
+      remainingSize: String(order.size),
+      limitPrice: String(order.limitPrice),
+      stopLoss: String(order.stopLoss || 0),
+      takeProfit: String(order.takeProfit || 0),
+      status: 'pending',
+      orderType: 'limit',
+      fee: '0',
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      expiresAt,
+    };
+
+    const exchangeOrderId = await this.tradingWs.submitOrder(orderForSubmit);
+
+    this.orderManager.updateStatus(order.clientOrderId, 'submitted', exchangeOrderId);
+
+    // 设置超时定时器
+    this.timeoutManager.schedule(order.clientOrderId, ttlMs, async () => {
+      const currentOrder = this.orderManager.getOrder(order.clientOrderId);
+      if (currentOrder && !['filled', 'cancelled', 'rejected'].includes(currentOrder.status)) {
+        await this.tradingWs.cancelOrder(exchangeOrderId);
+        this.orderManager.updateStatus(order.clientOrderId, 'cancelled');
+        this.riskEngine.updateShadowPosition(order.symbol, 0);
+      }
+    });
+
+    // 持久化
+    this.sqliteStore.saveOrder({
+      ...orderForSubmit,
+      orderId: exchangeOrderId,
+      status: 'submitted',
     });
 
     this.riskEngine.updateShadowPosition(signal.symbol, signal.positionSize);
 
-    console.log(`[SignalRouter] Order created: ${order.clientOrderId}`);
+    console.log(`[SignalRouter] Order submitted: ${order.clientOrderId} -> ${exchangeOrderId}`);
 
     return { accepted: true, reason: '' };
+  }
+
+  // 订单状态回调处理（含竞态防护）
+  private handleOrderUpdate(update: OrderUpdate): void {
+    const order = this.orderManager.getOrder(update.clientOrderId);
+    if (!order) return;
+
+    // 竞态防护：终态订单拒绝任何状态变更
+    if (['filled', 'cancelled', 'rejected'].includes(order.status)) {
+      console.log(`[SignalRouter] Order ${update.clientOrderId} already in terminal state ${order.status}, ignoring update to ${update.status}`);
+      return;
+    }
+
+    this.orderManager.updateStatus(order.clientOrderId, update.status, update.orderId, parseFloat(update.fee));
+
+    // 更新 Shadow Position 和持久化
+    if (update.status === 'filled') {
+      this.riskEngine.updateShadowPosition(order.symbol, 0);
+      this.sqliteStore.updatePosition(order.symbol, order.side === 'buy' ? 'long' : 'short', String(order.size), String(order.limitPrice));
+      this.timeoutManager.cancel(order.clientOrderId);
+    } else if (update.status === 'cancelled' || update.status === 'rejected') {
+      this.riskEngine.updateShadowPosition(order.symbol, 0);
+      this.timeoutManager.cancel(order.clientOrderId);
+    }
+
+    // 更新并保存订单
+    order.orderId = update.orderId;
+    order.status = update.status;
+    order.updatedAt = Date.now();
+    this.sqliteStore.saveOrder({
+      clientOrderId: order.clientOrderId,
+      orderId: order.orderId,
+      signalId: order.signalId,
+      symbol: order.symbol,
+      side: order.side,
+      size: String(order.size),
+      remainingSize: String(order.remainingSize),
+      limitPrice: String(order.limitPrice),
+      stopLoss: String(order.stopLoss || 0),
+      takeProfit: String(order.takeProfit || 0),
+      status: order.status,
+      orderType: 'limit',
+      fee: update.fee,
+      createdAt: order.createdAt,
+      updatedAt: Date.now(),
+      expiresAt: order.createdAt + this.config.signalTtlMs,
+    });
   }
 
   async startServer(port: number): Promise<grpc.Server> {
@@ -235,5 +374,8 @@ export class SignalRouter {
       clearInterval(this.cleanupInterval);
       this.cleanupInterval = null;
     }
+    this.timeoutManager.clearAll();
+    this.tradingWs.disconnect();
+    this.sqliteStore.close();
   }
 }

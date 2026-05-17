@@ -6,6 +6,7 @@ async function main() {
   const router = new SignalRouter(config);
 
   try {
+    await router.initialize();
     const server = await router.startServer(config.grpcPort);
     console.log(`TS Engine started on port ${config.grpcPort} (env: ${config.grvtEnv})`);
 
