@@ -77,7 +77,12 @@ const serverOptions = {
 ```
 
 断连检测时间：~15 秒（10s 间隔 + 5s 超时），远快于 TCP 默认 keepalive（2 小时）。
-| gRPC 保活 | 服务端 + 客户端双向 keepalive | Tailscale 虚拟网卡断网快速感知 |
+
+### 性能优化
+
+**滑点校验内存读取：** `MarketDataStream` 内部维护 `private latestPrices: Map<string, MarketData>`，提供同步方法 `getLatestPriceInMemory(symbol)`。`SignalRouter` 校验滑点时直接从内存 Map 读取，0ms 延迟，避免 Redis I/O 回路增加前置延迟。
+
+**SQLite busy_timeout：** 初始化 SQLite 时配置 `timeout: 5000`（5 秒），防止多信号并发写入时 `SQLITE_BUSY` 导致订单丢包。
 
 ---
 
@@ -98,6 +103,12 @@ const serverOptions = {
 - 每条消息包含：`symbol`, `lastPrice`, `bidPrice`, `askPrice`, `volume24h`, `timestamp`
 - 使用 `XADD` 命令，最大长度 10000（`MAXLEN ~ 10000`）
 
+**内存价格缓存（滑点校验）：**
+- `MarketDataStream` 内部维护 `private latestPrices: Map<string, MarketData>`
+- 每次接收 ticker 数据时同步更新 Map
+- 提供同步方法 `getLatestPriceInMemory(symbol): MarketData | null`
+- `SignalRouter` 滑点校验直接调用此方法，0ms 延迟，不走 Redis I/O
+
 ```typescript
 interface MarketData {
   symbol: string;
@@ -112,7 +123,8 @@ class MarketDataStream {
   constructor(config: GrvtConfig, redis: Redis, symbols: string[]);
   connect(): Promise<void>;
   disconnect(): Promise<void>;
-  getLatestPrice(symbol: string): Promise<MarketData | null>;
+  getLatestPrice(symbol: string): Promise<MarketData | null>;  // 异步，从 Redis 读取
+  getLatestPriceInMemory(symbol: string): MarketData | null;   // 同步，0ms 延迟
 }
 ```
 
@@ -173,6 +185,7 @@ interface Order {
 **订单记录持久化：**
 - SQLite WAL 模式，表 `orders`
 - 每次状态变更写入数据库
+- **busy_timeout: 5000ms** — 防止多信号并发写入时 `SQLITE_BUSY` 导致订单丢包
 
 **测试场景：**
 - 正常创建订单并等待成交
