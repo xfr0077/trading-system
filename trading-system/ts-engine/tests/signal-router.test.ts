@@ -1,10 +1,52 @@
 import { SignalRouter } from '../src/signal-router';
+import { Config } from '../src/config';
+import { MarketDataStream } from '../src/market-data';
+
+function createMockConfig(overrides = {}): Config {
+  return {
+    grvtApiKey: 'test-key',
+    grvtEnv: 'testnet',
+    redisUrl: 'redis://localhost:6379',
+    sqlitePath: '/tmp/test.db',
+    grpcPort: 0,
+    tailscaleAiIp: '127.0.0.1',
+    grvtMarketDataWsUrl: 'wss://market-data.dev.gravitymarkets.io/ws',
+    grvtTradingWsUrl: 'wss://trades.dev.gravitymarkets.io/ws',
+    grvtRestApiUrl: 'https://api.dev.gravitymarkets.io',
+    maxPositionSize: 1,
+    maxDailyLoss: 500,
+    maxConcurrentSignals: 3,
+    minConfidence: 60,
+    maxPriceDeviationPct: 0.5,
+    signalTtlMs: 30000,
+    marginWarningThreshold: 0.7,
+    marginCriticalThreshold: 0.9,
+    ...overrides,
+  };
+}
+
+function createMockMarketData(): MarketDataStream {
+  const mockStream = {
+    getLatestPriceInMemory: jest.fn((symbol: string) => ({
+      symbol,
+      lastPrice: 98500,
+      bidPrice: 98490,
+      askPrice: 98510,
+      volume24h: 1000,
+      timestamp: Date.now(),
+    })),
+  } as unknown as MarketDataStream;
+  return mockStream;
+}
 
 describe('SignalRouter', () => {
   let router: SignalRouter;
+  let mockMarketData: MarketDataStream;
 
   beforeEach(() => {
-    router = new SignalRouter();
+    mockMarketData = createMockMarketData();
+    router = new SignalRouter(createMockConfig());
+    router.setMarketData(mockMarketData);
   });
 
   afterEach(() => {
@@ -158,10 +200,12 @@ describe('SignalRouter', () => {
 
     test('should reject when port is already in use', async () => {
       const fixedPort = 19999;
-      const router2 = new SignalRouter();
+      const router2 = new SignalRouter(createMockConfig());
+      router2.setMarketData(createMockMarketData());
       const server1 = await router2.startServer(fixedPort);
 
-      const router3 = new SignalRouter();
+      const router3 = new SignalRouter(createMockConfig());
+      router3.setMarketData(createMockMarketData());
       await expect(router3.startServer(fixedPort)).rejects.toThrow();
 
       server1.forceShutdown();

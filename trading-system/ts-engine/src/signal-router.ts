@@ -1,6 +1,11 @@
 import * as grpc from '@grpc/grpc-js';
 import { loadSync } from '@grpc/proto-loader';
 import * as path from 'path';
+import { RiskEngine, RiskCheckInput } from './risk-engine';
+import { MarginMonitor } from './margin-monitor';
+import { MarketDataStream } from './market-data';
+import { OrderManager } from './order-manager';
+import { Config } from './config';
 
 const protoPath = path.join(__dirname, '../../proto/signal.proto');
 const protoDefinition = loadSync(protoPath);
@@ -38,10 +43,41 @@ export class SignalRouter {
   private seenSignals = new Map<string, number>();
   private readonly TTL_MS = 5 * 60 * 1000;
   private cleanupInterval: NodeJS.Timeout | null = null;
+  private riskEngine: RiskEngine;
+  private marginMonitor: MarginMonitor;
+  private marketData: MarketDataStream | null = null;
+  private orderManager: OrderManager;
 
-  constructor() {
+  constructor(config: Config) {
     this.cleanupInterval = setInterval(() => this.cleanupExpiredSignals(), 60 * 1000);
     this.cleanupInterval.unref();
+
+    this.riskEngine = new RiskEngine({
+      maxPositionSize: config.maxPositionSize,
+      maxDailyLoss: config.maxDailyLoss,
+      maxConcurrentSignals: config.maxConcurrentSignals,
+      minConfidence: config.minConfidence,
+      maxPriceDeviationPct: config.maxPriceDeviationPct,
+      signalTtlMs: config.signalTtlMs,
+      requireMarginOk: true,
+    });
+    this.marginMonitor = new MarginMonitor({
+      warningThreshold: config.marginWarningThreshold,
+      criticalThreshold: config.marginCriticalThreshold,
+    });
+    this.orderManager = new OrderManager();
+  }
+
+  setMarketData(stream: MarketDataStream): void {
+    this.marketData = stream;
+  }
+
+  getMarginMonitor(): MarginMonitor {
+    return this.marginMonitor;
+  }
+
+  getOrderManager(): OrderManager {
+    return this.orderManager;
   }
 
   private cleanupExpiredSignals(): void {
@@ -90,6 +126,39 @@ export class SignalRouter {
       throw new Error(`INVALID_ARGUMENT: ${validationError}`);
     }
 
+    if (!this.marketData) {
+      return { accepted: false, reason: 'MARKET_DATA_NOT_INITIALIZED' };
+    }
+    const currentPriceData = this.marketData.getLatestPriceInMemory(signal.symbol);
+    if (!currentPriceData) {
+      return { accepted: false, reason: 'PRICE_DATA_UNAVAILABLE' };
+    }
+
+    const marginStatus = this.marginMonitor.getStatus();
+    const riskInput: RiskCheckInput = {
+      signal: {
+        signalId: signal.signalId,
+        symbol: signal.symbol,
+        action: signal.action,
+        stopLoss: signal.stopLoss,
+        takeProfit: signal.takeProfit,
+        confidence: signal.confidence,
+        positionSize: signal.positionSize,
+        timestamp: signal.timestamp,
+        signalPrice: signal.signalPrice,
+        maxSlippageBps: signal.maxSlippageBps,
+      },
+      currentPrice: currentPriceData.lastPrice,
+      currentPositions: [],
+      shadowPositions: this.riskEngine.getShadowPositions(),
+      marginStatus,
+    };
+
+    const riskResult = await this.riskEngine.check(riskInput);
+    if (!riskResult.allowed) {
+      return { accepted: false, reason: riskResult.reason };
+    }
+
     const now = Date.now();
     const lastSeen = this.seenSignals.get(signal.signalId);
     if (lastSeen && now - lastSeen < this.TTL_MS) {
@@ -97,6 +166,20 @@ export class SignalRouter {
     }
 
     this.seenSignals.set(signal.signalId, now);
+
+    const order = this.orderManager.createOrder({
+      signalId: signal.signalId,
+      symbol: signal.symbol,
+      side: signal.action === 'long' ? 'buy' : signal.action === 'short' ? 'sell' : 'buy',
+      size: signal.positionSize,
+      limitPrice: signal.signalPrice,
+      stopLoss: signal.stopLoss,
+      takeProfit: signal.takeProfit,
+    });
+
+    this.riskEngine.updateShadowPosition(signal.symbol, signal.positionSize);
+
+    console.log(`[SignalRouter] Order created: ${order.clientOrderId}`);
 
     return { accepted: true, reason: '' };
   }

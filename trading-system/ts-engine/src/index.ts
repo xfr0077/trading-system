@@ -3,7 +3,7 @@ import { loadConfig } from './config';
 
 async function main() {
   const config = loadConfig();
-  const router = new SignalRouter();
+  const router = new SignalRouter(config);
 
   try {
     const server = await router.startServer(config.grpcPort);
