@@ -42,3 +42,33 @@ export interface RiskConfig {
   signalTtlMs: number;
   requireMarginOk: boolean;
 }
+
+// Phase 3: Order execution types
+
+export interface OrderUpdate {
+  clientOrderId: string;
+  orderId: string;
+  status: 'pending' | 'submitted' | 'filled' | 'cancelled' | 'rejected' | 'partially_filled';
+  fee: string;
+}
+
+export interface TradeRecord {
+  orderId: string;
+  symbol: string;
+  side: 'buy' | 'sell';
+  size: string;
+  price: string;
+  fee: string;
+  pnl: string;
+  timestamp: number;
+}
+
+export interface Position {
+  symbol: string;
+  side: 'long' | 'short';
+  size: string;
+  entryPrice: string;
+  unrealizedPnl: string;
+  realizedPnl: string;
+  updatedAt: number;
+}
