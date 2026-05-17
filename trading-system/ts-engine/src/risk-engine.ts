@@ -36,6 +36,7 @@ export interface RiskCheckResult {
 export interface RiskConfig {
   maxPositionSize: number;
   maxDailyLoss: number;
+  /** Total exposure multiplier (not signal count limit). Default: 3 */
   maxConcurrentSignals: number;
   minConfidence: number;
   maxPriceDeviationPct: number;
@@ -63,13 +64,17 @@ export class RiskEngine {
       return { allowed: false, reason: 'POSITION_SIZE_EXCEEDED' };
     }
 
+    if (currentPrice <= 0) {
+      return { allowed: false, reason: 'PRICE_DATA_INVALID' };
+    }
+
     const deviation = Math.abs(signal.signalPrice - currentPrice) / currentPrice * 100;
     if (deviation > this.config.maxPriceDeviationPct) {
       return { allowed: false, reason: 'PRICE_DEVIATION_EXCEEDED' };
     }
 
-    if (this.config.requireMarginOk && marginStatus.status === 'warning') {
-      return { allowed: false, reason: 'MARGIN_WARNING' };
+    if (this.config.requireMarginOk && (marginStatus.status === 'warning' || marginStatus.status === 'critical')) {
+      return { allowed: false, reason: marginStatus.status === 'critical' ? 'MARGIN_CRITICAL' : 'MARGIN_WARNING' };
     }
 
     const currentShadow = this.shadowPositions.get(signal.symbol) || 0;
@@ -83,7 +88,12 @@ export class RiskEngine {
 
   updateShadowPosition(symbol: string, delta: number): void {
     const current = this.shadowPositions.get(symbol) || 0;
-    this.shadowPositions.set(symbol, current + delta);
+    const newValue = current + delta;
+    if (newValue <= 0) {
+      this.shadowPositions.delete(symbol);
+    } else {
+      this.shadowPositions.set(symbol, newValue);
+    }
   }
 
   getShadowPosition(symbol: string): number {
