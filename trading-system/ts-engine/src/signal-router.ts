@@ -9,16 +9,16 @@ const protoDescriptor = grpc.loadPackageDefinition(protoDefinition) as any;
 const VALID_ACTIONS = new Set(['long', 'short', 'close']);
 
 interface TradingSignal {
-  signal_id: string;
+  signalId: string;
   symbol: string;
   action: string;
-  stop_loss: number;
-  take_profit: number;
+  stopLoss: number;
+  takeProfit: number;
   confidence: number;
-  position_size: number;
+  positionSize: number;
   timestamp: number;
-  signal_price: number;
-  max_slippage_bps: number;
+  signalPrice: number;
+  maxSlippageBps: number;
 }
 
 interface SignalInput {
@@ -107,18 +107,18 @@ export class SignalRouter {
       SendSignal: async (call: grpc.ServerUnaryCall<TradingSignal, any>, callback: grpc.sendUnaryData<any>) => {
         try {
           const result = await this.handleSignal({
-            signalId: call.request.signal_id,
+            signalId: call.request.signalId,
             symbol: call.request.symbol,
             action: call.request.action,
-            stopLoss: call.request.stop_loss,
-            takeProfit: call.request.take_profit,
+            stopLoss: call.request.stopLoss,
+            takeProfit: call.request.takeProfit,
             confidence: call.request.confidence,
-            positionSize: call.request.position_size,
+            positionSize: call.request.positionSize,
             timestamp: call.request.timestamp,
-            signalPrice: call.request.signal_price,
-            maxSlippageBps: call.request.max_slippage_bps,
+            signalPrice: call.request.signalPrice,
+            maxSlippageBps: call.request.maxSlippageBps,
           });
-          callback(null, { signal_id: call.request.signal_id, accepted: result.accepted, reason: result.reason });
+          callback(null, { signal_id: call.request.signalId, accepted: result.accepted, reason: result.reason });
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
           console.error(`[SignalRouter] SendSignal error: ${message}`);
