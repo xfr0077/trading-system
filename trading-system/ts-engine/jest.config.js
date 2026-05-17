@@ -5,4 +5,7 @@ module.exports = {
   roots: ['<rootDir>/tests'],
   testMatch: ['**/*.test.ts'],
   moduleFileExtensions: ['ts', 'js', 'json'],
+  moduleNameMapper: {
+    '^better-sqlite3$': '<rootDir>/tests/__mocks__/better-sqlite3.ts',
+  },
 };
