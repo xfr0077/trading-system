@@ -1,0 +1,33 @@
+syntax = "proto3";
+
+package signal;
+
+service SignalService {
+  rpc SendSignal(TradingSignal) returns (SignalAck);
+  rpc HealthCheck(HealthRequest) returns (HealthResponse);
+}
+
+message TradingSignal {
+  string signal_id = 1;
+  string symbol = 2;
+  string action = 3;  // "long", "short", "close"
+  double stop_loss = 4;
+  double take_profit = 5;
+  double confidence = 6;
+  double position_size = 7;
+  int64 timestamp = 8;
+  double signal_price = 9;
+  int32 max_slippage_bps = 10;
+}
+
+message SignalAck {
+  string signal_id = 1;
+  bool accepted = 2;
+  string reason = 3;
+}
+
+message HealthRequest {}
+message HealthResponse {
+  bool healthy = 1;
+  string version = 2;
+}
