@@ -78,6 +78,8 @@ class SignalClient:
         position_size: float,
         signal_price: float,
         max_slippage_bps: int = 10,
+        order_ttl_ms: int = 300000,
+        order_type: str = "limit",
     ) -> SignalAck:
         self._validate_signal(symbol, action, stop_loss, take_profit, confidence, position_size, signal_price)
 
@@ -92,6 +94,8 @@ class SignalClient:
             timestamp=int(time.time() * 1000),
             signal_price=signal_price,
             max_slippage_bps=max_slippage_bps,
+            order_ttl_ms=order_ttl_ms,
+            order_type=order_type,
         )
 
         try:
