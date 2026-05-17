@@ -94,3 +94,60 @@ describe('Config', () => {
     expect(config.tailscaleAiIp).toBe('127.0.0.1');
   });
 });
+
+describe('Config Phase 2', () => {
+  const originalEnv = { ...process.env };
+
+  afterEach(() => {
+    process.env = { ...originalEnv };
+  });
+
+  test('should load GRVT WebSocket URLs', () => {
+    process.env.GRVT_API_KEY = 'test-key';
+    process.env.GRVT_MARKET_DATA_WS_URL = 'wss://market-data.test/ws';
+    process.env.GRVT_TRADING_WS_URL = 'wss://trades.test/ws';
+    process.env.GRVT_REST_API_URL = 'https://api.test';
+
+    const config = loadConfig();
+
+    expect(config.grvtMarketDataWsUrl).toBe('wss://market-data.test/ws');
+    expect(config.grvtTradingWsUrl).toBe('wss://trades.test/ws');
+    expect(config.grvtRestApiUrl).toBe('https://api.test');
+  });
+
+  test('should use default WebSocket URLs', () => {
+    process.env.GRVT_API_KEY = 'test-key';
+    delete process.env.GRVT_MARKET_DATA_WS_URL;
+    delete process.env.GRVT_TRADING_WS_URL;
+    delete process.env.GRVT_REST_API_URL;
+
+    const config = loadConfig();
+
+    expect(config.grvtMarketDataWsUrl).toBe('wss://market-data.dev.gravitymarkets.io/ws');
+    expect(config.grvtTradingWsUrl).toBe('wss://trades.dev.gravitymarkets.io/ws');
+    expect(config.grvtRestApiUrl).toBe('https://api.dev.gravitymarkets.io');
+  });
+
+  test('should load risk config', () => {
+    process.env.GRVT_API_KEY = 'test-key';
+    process.env.MAX_POSITION_SIZE = '0.5';
+    process.env.MAX_DAILY_LOSS = '1000';
+    process.env.MAX_CONCURRENT_SIGNALS = '5';
+    process.env.MIN_CONFIDENCE = '70';
+    process.env.MAX_PRICE_DEVIATION_PCT = '1.0';
+    process.env.SIGNAL_TTL_MS = '60000';
+    process.env.MARGIN_WARNING_THRESHOLD = '0.6';
+    process.env.MARGIN_CRITICAL_THRESHOLD = '0.85';
+
+    const config = loadConfig();
+
+    expect(config.maxPositionSize).toBe(0.5);
+    expect(config.maxDailyLoss).toBe(1000);
+    expect(config.maxConcurrentSignals).toBe(5);
+    expect(config.minConfidence).toBe(70);
+    expect(config.maxPriceDeviationPct).toBe(1.0);
+    expect(config.signalTtlMs).toBe(60000);
+    expect(config.marginWarningThreshold).toBe(0.6);
+    expect(config.marginCriticalThreshold).toBe(0.85);
+  });
+});
