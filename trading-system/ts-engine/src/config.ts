@@ -18,6 +18,34 @@ export interface Config {
   marginCriticalThreshold: number;
 }
 
+function validatePositiveNumber(value: number, name: string): number {
+  if (isNaN(value)) {
+    throw new Error(`${name} must be a valid number`);
+  }
+  if (value <= 0) {
+    throw new Error(`${name} must be a positive number`);
+  }
+  return value;
+}
+
+function validateNonNegativeNumber(value: number, name: string): number {
+  if (isNaN(value)) {
+    throw new Error(`${name} must be a valid number`);
+  }
+  if (value < 0) {
+    throw new Error(`${name} must be a non-negative number`);
+  }
+  return value;
+}
+
+function validateUrl(value: string, name: string, allowedPrefixes: string[]): string {
+  const isValid = allowedPrefixes.some(prefix => value.startsWith(prefix));
+  if (!isValid) {
+    throw new Error(`${name} must start with ${allowedPrefixes.join(' or ')}`);
+  }
+  return value;
+}
+
 export function loadConfig(): Config {
   const grvtApiKey = process.env.GRVT_API_KEY;
   if (!grvtApiKey) throw new Error('GRVT_API_KEY is required');
@@ -32,6 +60,58 @@ export function loadConfig(): Config {
     throw new Error('GRPC_PORT must be a valid port number');
   }
 
+  const maxPositionSize = validatePositiveNumber(
+    parseFloat(process.env.MAX_POSITION_SIZE || '0.1'),
+    'MAX_POSITION_SIZE'
+  );
+
+  const maxDailyLoss = validatePositiveNumber(
+    parseFloat(process.env.MAX_DAILY_LOSS || '500'),
+    'MAX_DAILY_LOSS'
+  );
+
+  const minConfidenceRaw = parseFloat(process.env.MIN_CONFIDENCE || '60.0');
+  if (isNaN(minConfidenceRaw)) {
+    throw new Error('MIN_CONFIDENCE must be a valid number');
+  }
+  if (minConfidenceRaw < 0 || minConfidenceRaw > 100) {
+    throw new Error('MIN_CONFIDENCE must be between 0 and 100');
+  }
+
+  const maxPriceDeviationPct = validateNonNegativeNumber(
+    parseFloat(process.env.MAX_PRICE_DEVIATION_PCT || '0.5'),
+    'MAX_PRICE_DEVIATION_PCT'
+  );
+
+  const marginWarningThreshold = parseFloat(process.env.MARGIN_WARNING_THRESHOLD || '0.7');
+  const marginCriticalThreshold = parseFloat(process.env.MARGIN_CRITICAL_THRESHOLD || '0.9');
+
+  if (isNaN(marginWarningThreshold) || isNaN(marginCriticalThreshold)) {
+    throw new Error('Margin thresholds must be valid numbers');
+  }
+
+  if (marginWarningThreshold >= marginCriticalThreshold) {
+    throw new Error('MARGIN_WARNING_THRESHOLD must be less than MARGIN_CRITICAL_THRESHOLD');
+  }
+
+  const grvtMarketDataWsUrl = validateUrl(
+    process.env.GRVT_MARKET_DATA_WS_URL || 'wss://market-data.dev.gravitymarkets.io/ws',
+    'GRVT_MARKET_DATA_WS_URL',
+    ['wss://', 'https://']
+  );
+
+  const grvtTradingWsUrl = validateUrl(
+    process.env.GRVT_TRADING_WS_URL || 'wss://trades.dev.gravitymarkets.io/ws',
+    'GRVT_TRADING_WS_URL',
+    ['wss://', 'https://']
+  );
+
+  const grvtRestApiUrl = validateUrl(
+    process.env.GRVT_REST_API_URL || 'https://api.dev.gravitymarkets.io',
+    'GRVT_REST_API_URL',
+    ['https://']
+  );
+
   return {
     grvtApiKey,
     grvtEnv: grvtEnv || 'testnet',
@@ -39,16 +119,16 @@ export function loadConfig(): Config {
     sqlitePath: process.env.SQLITE_PATH || '/data/trades.db',
     grpcPort: port,
     tailscaleAiIp: process.env.TAILSCALE_AI_IP || '127.0.0.1',
-    grvtMarketDataWsUrl: process.env.GRVT_MARKET_DATA_WS_URL || 'wss://market-data.dev.gravitymarkets.io/ws',
-    grvtTradingWsUrl: process.env.GRVT_TRADING_WS_URL || 'wss://trades.dev.gravitymarkets.io/ws',
-    grvtRestApiUrl: process.env.GRVT_REST_API_URL || 'https://api.dev.gravitymarkets.io',
-    maxPositionSize: parseFloat(process.env.MAX_POSITION_SIZE || '0.1'),
-    maxDailyLoss: parseFloat(process.env.MAX_DAILY_LOSS || '500'),
+    grvtMarketDataWsUrl,
+    grvtTradingWsUrl,
+    grvtRestApiUrl,
+    maxPositionSize,
+    maxDailyLoss,
     maxConcurrentSignals: parseInt(process.env.MAX_CONCURRENT_SIGNALS || '3', 10),
-    minConfidence: parseFloat(process.env.MIN_CONFIDENCE || '60.0'),
-    maxPriceDeviationPct: parseFloat(process.env.MAX_PRICE_DEVIATION_PCT || '0.5'),
+    minConfidence: minConfidenceRaw,
+    maxPriceDeviationPct,
     signalTtlMs: parseInt(process.env.SIGNAL_TTL_MS || '30000', 10),
-    marginWarningThreshold: parseFloat(process.env.MARGIN_WARNING_THRESHOLD || '0.7'),
-    marginCriticalThreshold: parseFloat(process.env.MARGIN_CRITICAL_THRESHOLD || '0.9'),
+    marginWarningThreshold,
+    marginCriticalThreshold,
   };
 }
