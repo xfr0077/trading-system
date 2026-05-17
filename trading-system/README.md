@@ -25,7 +25,7 @@
 │        ▼                                                        │
 │  ┌──────────────┐  ┌──────────────┐                             │
 │  │  Redis       │  │  SQLite WAL  │                             │
-│  │  (行情缓存)   │  │  (交易记录)   │                             │
+│  │  (行情缓存)   │  │  (订单/持仓)  │                             │
 │  └──────────────┘  └──────────────┘                             │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -125,7 +125,11 @@ trading-system/
 │   ├── src/
 │   │   ├── index.ts                # 入口文件
 │   │   ├── config.ts               # 配置管理（环境变量校验）
-│   │   └── signal-router.ts        # gRPC Server（信号去重、验证）
+│   │   ├── signal-router.ts        # gRPC Server（信号去重、验证、风控集成）
+│   │   ├── risk-engine.ts          # 风控引擎（TTL/置信度/仓位/滑点/保证金/Shadow Position）
+│   │   ├── margin-monitor.ts       # 保证金监控（阈值预警、状态回调）
+│   │   ├── order-manager.ts        # 订单管理器（状态机、部分成交）
+│   │   └── market-data.ts          # GRVT 行情 WebSocket + Redis 写入
 │   ├── tests/                      # 单元测试
 │   ├── proto/                      # 生成的 gRPC TypeScript 代码
 │   ├── package.json
@@ -134,6 +138,11 @@ trading-system/
 │   └── .dockerignore
 ├── python-ai/                      # 本地 Python AI 服务
 │   ├── src/
+│   │   ├── main.py                 # AI 服务主循环
+│   │   ├── config.py               # Pydantic 配置管理
+│   │   ├── redis_reader.py         # Redis Streams 消费者（跳尾机制）
+│   │   ├── feature_engine.py       # 特征工程（MA/RSI/MACD/布林带）
+│   │   ├── model_inference.py      # ONNX CPU 推理
 │   │   ├── signal_client.py        # gRPC Client（发送信号到 TS Engine）
 │   │   └── proto/                  # 生成的 gRPC Python 代码
 │   ├── tests/                      # 单元测试
@@ -180,12 +189,16 @@ Proto 定义位于 `proto/signal.proto`，包含两个 RPC 方法：
 - **信号去重**: 5 分钟 TTL 窗口，自动清理过期信号 ID
 - **输入验证**: 校验 action 合法性、confidence 范围、position_size 正数等
 - **gRPC 错误处理**: 区分 `INVALID_ARGUMENT`、`UNAVAILABLE`、`DEADLINE_EXCEEDED` 等状态码
+- **风控引擎**: TTL 校验、置信度、单笔仓位、滑点保护、保证金联动、Shadow Position
+- **订单管理**: 状态机（pending → submitted → partially_filled → filled/cancelled/rejected）
+- **行情数据**: GRVT WebSocket → Redis Streams → 内存价格缓存（0ms 滑点校验）
+- **保证金监控**: 自动阈值计算（warning/critical）、状态变更回调
 
 ### Python AI Client
 
 - **参数校验**: 发送前验证信号参数，避免无效请求
 - **错误处理**: 捕获 gRPC 异常并转换为 `SignalError`
-- **连接管理**: 支持上下文管理器（`with` 语句），自动关闭 channel
+- **连接管理**: 支持同步/异步上下文管理器，自动关闭 channel
 - **Keepalive**: 默认配置 gRPC 保活选项，防止连接静默断开
 
 ## 部署指南
@@ -233,6 +246,7 @@ TS_ENGINE_GRPC_URL=100.x.x.x:50051  # VPS 的 Tailscale IP + gRPC 端口
 4. **运行 AI 服务**
 
 ```bash
+cd python-ai
 python src/main.py
 ```
 
@@ -257,16 +271,18 @@ python src/main.py
 
 ```bash
 # TypeScript
-cd ts-engine && npx jest tests/signal-router.test.ts
+cd ts-engine && npx jest tests/risk-engine.test.ts
 
 # Python
-cd python-ai && pytest tests/test_signal_client.py -v
+cd python-ai && pytest tests/test_feature_engine.py -v
 
 # 集成测试
 pytest tests/integration/test_e2e.py -v
 ```
 
 ## 环境变量
+
+### TS Engine
 
 | 变量 | 必需 | 默认值 | 说明 |
 |------|------|--------|------|
@@ -276,17 +292,60 @@ pytest tests/integration/test_e2e.py -v
 | `REDIS_URL` | - | `redis://localhost:6379` | Redis 连接字符串 |
 | `SQLITE_PATH` | - | `/data/trades.db` | SQLite 数据库路径 |
 | `TAILSCALE_AI_IP` | ✅ | - | 本地 AI 的 Tailscale IP |
+| `GRVT_MARKET_DATA_WS_URL` | - | `wss://market-data.dev.gravitymarkets.io/ws` | GRVT 行情 WebSocket |
+| `GRVT_TRADING_WS_URL` | - | `wss://trades.dev.gravitymarkets.io/ws` | GRVT 交易 WebSocket |
+| `MAX_POSITION_SIZE` | - | `0.1` | 单笔最大仓位 |
+| `MAX_DAILY_LOSS` | - | `500` | 每日最大亏损（USDT） |
+| `MAX_CONCURRENT_SIGNALS` | - | `3` | 同一标的最大并发持仓 |
+| `MIN_CONFIDENCE` | - | `60.0` | 最低置信度阈值 |
+| `MAX_PRICE_DEVIATION_PCT` | - | `0.5` | 最大价格偏差百分比 |
+| `SIGNAL_TTL_MS` | - | `30000` | 信号有效期（毫秒） |
+| `MARGIN_WARNING_THRESHOLD` | - | `0.7` | 保证金率预警阈值 |
+| `MARGIN_CRITICAL_THRESHOLD` | - | `0.9` | 保证金率强平阈值 |
 
-## Phase 2 计划
+### Python AI
 
-Phase 1 已完成基础通信框架，Phase 2 将实现：
+| 变量 | 必需 | 默认值 | 说明 |
+|------|------|--------|------|
+| `TS_ENGINE_GRPC_URL` | - | `localhost:50051` | TS Engine gRPC 地址 |
+| `REDIS_URL` | - | `redis://localhost:6379` | Redis 连接字符串 |
+| `MODEL_PATH` | - | `models/model.onnx` | ONNX 模型路径 |
+| `FEATURE_WINDOW` | - | `100` | K 线特征窗口大小 |
+| `CONFIDENCE_THRESHOLD` | - | `70.0` | 最低置信度阈值 |
+| `SYMBOLS` | - | `BTC_USDT_Perp` | 监控的交易对（逗号分隔） |
 
-- [ ] **GRVT WebSocket 行情接收** (`market-data.ts`) — 实时接收 K 线和深度数据
-- [ ] **订单管理器** (`order-manager.ts`) — 订单状态机、生命周期管理
-- [ ] **风控引擎** (`risk-engine.ts`) — 仓位限制、最大回撤、风险敞口计算
-- [ ] **保证金监控** (`margin-monitor.ts`) — 实时保证金率、强平预警
-- [ ] **Python 特征工程** (`feature_engine.py`) — 技术指标计算、特征标准化
-- [ ] **ONNX 模型推理** (`model_inference.py`) — CPU 模型加载、批量预测
+## Phase 进度
+
+### Phase 1 ✅ 已完成
+
+- [x] 项目初始化与 Proto 定义
+- [x] TS Engine 配置与日志系统
+- [x] TS Engine 信号路由器 (gRPC Server)
+- [x] Python AI gRPC Client
+- [x] Docker Compose 配置 (VPS 端)
+- [x] 集成测试 (端到端通信)
+
+### Phase 2 ✅ 已完成
+
+- [x] TS Engine 配置扩展（GRVT 端点、风控参数）
+- [x] Risk Engine（风控引擎 + Shadow Position）
+- [x] Margin Monitor（保证金监控 + 阈值预警）
+- [x] Order Manager（订单状态机 + 部分成交）
+- [x] Market Data（GRVT WebSocket + Redis + 内存缓存）
+- [x] SignalRouter 集成风控和滑点校验
+- [x] Python AI 配置管理（Pydantic）
+- [x] Python AI Redis 行情消费者（跳尾机制）
+- [x] Python AI 特征工程（MA/RSI/MACD/布林带）
+- [x] Python AI ONNX 模型推理（CPU）
+- [x] Python AI 主循环
+
+### Phase 3 🚧 计划中
+
+- [ ] GRVT TradingWS 实际下单（限价 + 市价）
+- [ ] 订单超时取消（信号携带 TTL）
+- [ ] SQLite 持久化（订单 + 持仓 + 交易历史）
+- [ ] GRVT WebSocket 实际连接（替换 TODO）
+- [ ] 信号优先级队列预留接口
 
 ## 许可证
 
