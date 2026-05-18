@@ -1,18 +1,36 @@
 import { SignalRouter } from '../src/signal-router';
 import { Config } from '../src/config';
 import { MarketDataStream } from '../src/market-data';
+import { EGrvtEnvironment } from '@grvt/sdk';
+import { GrvtEnv } from '@wezzcoetzee/grvt';
+
+// Mock TradingWebSocket
+jest.mock('../src/trading-ws', () => {
+  return {
+    TradingWebSocket: jest.fn().mockImplementation(() => ({
+      connect: jest.fn().mockResolvedValue(undefined),
+      submitOrder: jest.fn().mockResolvedValue('exchange-order-1'),
+      cancelOrder: jest.fn().mockResolvedValue(undefined),
+      getInstruments: jest.fn().mockResolvedValue([]),
+      addInstrument: jest.fn(),
+      onOrderUpdate: jest.fn(),
+      disconnect: jest.fn(),
+    })),
+  };
+});
 
 function createMockConfig(overrides = {}): Config {
   return {
     grvtApiKey: 'test-key',
-    grvtEnv: 'testnet',
+    grvtPrivateKey: '0xtest-secret',
+    grvtTradingAccountId: 'test-account',
+    grvtEnv: EGrvtEnvironment.TESTNET,
+    grvtEnvCommunity: GrvtEnv.TESTNET,
     redisUrl: 'redis://localhost:6379',
     sqlitePath: '/tmp/test.db',
     grpcPort: 0,
     tailscaleAiIp: '127.0.0.1',
-    grvtMarketDataWsUrl: 'wss://market-data.dev.gravitymarkets.io/ws',
-    grvtTradingWsUrl: 'wss://trades.dev.gravitymarkets.io/ws',
-    grvtRestApiUrl: 'https://api.dev.gravitymarkets.io',
+    symbols: ['BTC_USDT_Perp'],
     maxPositionSize: 1,
     maxDailyLoss: 500,
     maxConcurrentSignals: 3,
@@ -149,12 +167,19 @@ describe('SignalRouter', () => {
       );
     });
 
-    test('should accept all valid actions', async () => {
-      for (const action of ['long', 'short', 'close']) {
+    test('should accept long and short actions', async () => {
+      for (const action of ['long', 'short']) {
         const signal = createValidSignal({ signalId: `action-${action}`, action });
         const ack = await router.handleSignal(signal);
         expect(ack.accepted).toBe(true);
       }
+    });
+
+    test('should reject close when no position exists', async () => {
+      const signal = createValidSignal({ signalId: 'action-close', action: 'close' });
+      const ack = await router.handleSignal(signal);
+      expect(ack.accepted).toBe(false);
+      expect(ack.reason).toBe('NO_POSITION_TO_CLOSE');
     });
   });
 

@@ -1,29 +1,31 @@
 import { MarketDataStream, MarketData } from '../src/market-data';
 
+const mockRedis = {
+  xadd: jest.fn().mockResolvedValue('ok'),
+  disconnect: jest.fn().mockResolvedValue(undefined),
+};
+
 jest.mock('ioredis', () => {
-  return jest.fn().mockImplementation(() => ({
-    xadd: jest.fn().mockResolvedValue('ok'),
-    disconnect: jest.fn(),
-  }));
+  return jest.fn().mockImplementation(() => mockRedis);
 });
 
 describe('MarketDataStream', () => {
   let stream: MarketDataStream;
 
   beforeEach(() => {
+    jest.clearAllMocks();
     stream = new MarketDataStream(
-      { wsUrl: 'wss://test/ws', apiKey: 'test-key' },
-      {} as any,
-      ['BTC_USDT_Perp']
+      { apiKey: 'test-key', env: 'testnet' as any, symbols: ['BTC_USDT_Perp'] },
+      mockRedis as any
     );
   });
 
   test('should parse ticker data correctly', () => {
     const rawData = {
-      symbol: 'BTC_USDT_Perp',
+      instrument: 'BTC_USDT_Perp',
       last_price: '98500.50',
-      bid_price: '98499.00',
-      ask_price: '98501.00',
+      best_bid_price: '98499.00',
+      best_ask_price: '98501.00',
       volume_24h: '1234.56',
       event_time: '1716000000000000000',
     };
@@ -45,10 +47,10 @@ describe('MarketDataStream', () => {
 
   test('should update in-memory price cache', () => {
     const rawData = {
-      symbol: 'BTC_USDT_Perp',
+      instrument: 'BTC_USDT_Perp',
       last_price: '98500.50',
-      bid_price: '98499.00',
-      ask_price: '98501.00',
+      best_bid_price: '98499.00',
+      best_ask_price: '98501.00',
       volume_24h: '1234.56',
       event_time: '1716000000000000000',
     };
