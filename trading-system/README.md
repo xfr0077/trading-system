@@ -339,13 +339,15 @@ pytest tests/integration/test_e2e.py -v
 - [x] Python AI ONNX 模型推理（CPU）
 - [x] Python AI 主循环
 
-### Phase 3 🚧 计划中
+### Phase 3 ✅ 已完成
 
-- [ ] GRVT TradingWS 实际下单（限价 + 市价）
-- [ ] 订单超时取消（信号携带 TTL）
-- [ ] SQLite 持久化（订单 + 持仓 + 交易历史）
-- [ ] GRVT WebSocket 实际连接（替换 TODO）
-- [ ] 信号优先级队列预留接口
+- [x] GRVT TradingWS 实际下单（限价 + 市价，REST API，EIP-712 签名）
+- [x] 订单超时取消（OrderTimeoutManager，支持重启恢复）
+- [x] SQLite 持久化（订单 + 持仓 + 交易历史，WAL 模式）
+- [x] GRVT WebSocket 实际连接（@wezzcoetzee/grvt SDK，自动重连）
+- [x] 信号优先级队列预留接口（ISignalQueue）
+- [x] 重启恢复：从 SQLite 恢复未完成订单的取消定时器
+- [x] 竞态防护：终态订单拒收后置状态变更
 
 ## 许可证
 
