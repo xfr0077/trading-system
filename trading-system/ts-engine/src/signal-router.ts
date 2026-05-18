@@ -1,6 +1,7 @@
 import * as grpc from '@grpc/grpc-js';
 import { loadSync } from '@grpc/proto-loader';
 import * as path from 'path';
+import * as fs from 'fs';
 import { RiskEngine, RiskCheckInput } from './risk-engine';
 import { MarginMonitor } from './margin-monitor';
 import { MarketDataStream } from './market-data';
@@ -12,8 +13,16 @@ import { TradingWebSocket, GrvtConfig } from './trading-ws';
 import { GrvtEnv } from '@wezzcoetzee/grvt';
 import { OrderUpdate } from './types';
 import { ISignalQueue, DefaultSignalQueue } from './signal-queue';
+import { PositionTracker, PositionData } from './position-tracker';
+import { SLTPMonitor, SLTPOrder } from './sltp-monitor';
 
-const protoPath = path.join(__dirname, '../../proto/signal.proto');
+const protoPaths = [
+  path.join(__dirname, '../../proto/signal.proto'),
+  path.join(__dirname, '../proto/signal.proto'),
+  path.join('/app/proto/signal.proto'),
+  path.join(process.cwd(), 'proto/signal.proto'),
+];
+const protoPath = protoPaths.find(p => fs.existsSync(p)) || protoPaths[0];
 const protoDefinition = loadSync(protoPath);
 const protoDescriptor = grpc.loadPackageDefinition(protoDefinition) as any;
 
@@ -59,6 +68,8 @@ export class SignalRouter {
   private timeoutManager: OrderTimeoutManager;
   private tradingWs: TradingWebSocket;
   private signalQueue: ISignalQueue;
+  private positionTracker: PositionTracker;
+  private sltpMonitor: SLTPMonitor;
   private config: Config;
 
   constructor(config: Config) {
@@ -84,6 +95,8 @@ export class SignalRouter {
     this.timeoutManager = new OrderTimeoutManager();
     this.tradingWs = new TradingWebSocket();
     this.signalQueue = new DefaultSignalQueue();
+    this.positionTracker = new PositionTracker();
+    this.sltpMonitor = new SLTPMonitor();
 
     this.tradingWs.onOrderUpdate((update) => this.handleOrderUpdate(update));
   }
@@ -106,6 +119,24 @@ export class SignalRouter {
     });
     console.log(`[SignalRouter] Restored ${openOrders.length} pending orders from database`);
 
+    // 同步数据库中的挂单到 positionTracker，防止重复下单
+    for (const order of openOrders) {
+      this.positionTracker['openOrders'].set(order.clientOrderId, {
+        orderId: order.orderId || order.clientOrderId,
+        symbol: order.symbol,
+        side: order.side,
+        size: parseFloat(order.size),
+        price: parseFloat(order.limitPrice),
+        stopLoss: order.stopLoss ? parseFloat(order.stopLoss) : undefined,
+        takeProfit: order.takeProfit ? parseFloat(order.takeProfit) : undefined,
+        status: order.status,
+        createdAt: order.createdAt,
+      });
+    }
+    if (openOrders.length > 0) {
+      console.log(`[SignalRouter] Synced ${openOrders.length} open orders to positionTracker`);
+    }
+
     // 连接 TradingWS
     await this.tradingWs.connect({
       apiKey: this.config.grvtApiKey,
@@ -113,17 +144,61 @@ export class SignalRouter {
       tradingAccountId: this.config.grvtTradingAccountId,
       env: this.config.grvtEnv,
     });
+
+    // 启动持仓轮询
+    this.positionTracker.startPolling(
+      () => this.tradingWs.getPositions(),
+      () => this.tradingWs.getOpenOrders(),
+    );
+
+    // 首次同步持仓，确保信号到达前有数据
+    try {
+      const positions = await this.tradingWs.getPositions();
+      const orders = await this.tradingWs.getOpenOrders();
+      if (positions.length > 0 || orders.length > 0) {
+        this.positionTracker.sync(positions, orders);
+      }
+    } catch (err) {
+      console.warn('[SignalRouter] Initial position fetch failed, will rely on polling:', err);
+    }
+
+    // 加载 instruments
+    await this.loadInstruments();
+  }
+
+  private async loadInstruments(): Promise<void> {
+    if (!this.tradingWs || !this.config) return;
+    try {
+      const instruments = await this.tradingWs.getInstruments();
+      for (const inst of instruments) {
+        this.tradingWs.addInstrument(inst.symbol, inst.instrument_hash, inst.base_decimals || 9);
+      }
+      console.log(`[SignalRouter] Loaded ${instruments.length} instruments`);
+    } catch (err) {
+      console.error('[SignalRouter] Failed to load instruments:', err);
+    }
   }
 
   async initializeMarketData(redis: any): Promise<void> {
     const { MarketDataStream } = await import('./market-data');
     this.marketData = new MarketDataStream({
       apiKey: this.config.grvtApiKey,
-      apiSecret: this.config.grvtApiSecret,
-      env: this.config.grvtEnv,
+      env: this.config.grvtEnvCommunity,
       symbols: this.config.symbols,
     }, redis);
     await this.marketData.connect();
+
+    this.marketData.onPriceUpdate((data) => {
+      const triggered = this.sltpMonitor.checkPrice(data.symbol, data.lastPrice, data.bidPrice, data.askPrice);
+      for (const t of triggered) {
+        const closeSide = t.side === 'long' ? 'sell' : 'buy';
+        const triggeredType = t.stopLoss ? 'stop_loss' : 'take_profit';
+        console.log(`[SLTP] ${triggeredType.toUpperCase()} triggered for ${t.symbol} @ ${data.lastPrice}`);
+        this.submitCloseOrder(t.symbol, closeSide, t.size, data.lastPrice, t).catch(err => {
+          console.error(`[SLTP] Failed to submit close order: ${err.message}`);
+        });
+      }
+    });
   }
 
   setMarketData(stream: MarketDataStream): void {
@@ -136,6 +211,38 @@ export class SignalRouter {
 
   getOrderManager(): OrderManager {
     return this.orderManager;
+  }
+
+  private async submitCloseOrder(symbol: string, side: 'buy' | 'sell', size: number, price: number, sltpOrder: SLTPOrder): Promise<string | null> {
+    try {
+      const orderForSubmit: Order = {
+        clientOrderId: `sltp-${sltpOrder.clientOrderId}-${Date.now()}`,
+        orderId: '',
+        signalId: '',
+        symbol,
+        side,
+        size: String(size),
+        remainingSize: String(size),
+        limitPrice: String(price),
+        stopLoss: '0',
+        takeProfit: '0',
+        status: 'pending',
+        orderType: 'market',
+        fee: '0',
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        expiresAt: Date.now() + 30000,
+      };
+
+      const exchangeOrderId = await this.tradingWs.submitOrder(orderForSubmit);
+      if (exchangeOrderId) {
+        console.log(`[SLTP] Close order submitted: ${orderForSubmit.clientOrderId} -> ${exchangeOrderId}`);
+      }
+      return exchangeOrderId;
+    } catch (err) {
+      console.error(`[SLTP] Close order failed: ${(err as Error).message}`);
+      return null;
+    }
   }
 
   private cleanupExpiredSignals(): void {
@@ -193,6 +300,8 @@ export class SignalRouter {
     }
 
     const marginStatus = this.marginMonitor.getStatus();
+    const realPositions = this.positionTracker.getPositions();
+    const currentPositions = Array.from(realPositions.values()).map(p => ({ symbol: p.symbol, size: p.size }));
     const riskInput: RiskCheckInput = {
       signal: {
         signalId: signal.signalId,
@@ -207,7 +316,7 @@ export class SignalRouter {
         maxSlippageBps: signal.maxSlippageBps,
       },
       currentPrice: currentPriceData.lastPrice,
-      currentPositions: [],
+      currentPositions,
       shadowPositions: this.riskEngine.getShadowPositions(),
       marginStatus,
     };
@@ -215,6 +324,27 @@ export class SignalRouter {
     const riskResult = await this.riskEngine.check(riskInput);
     if (!riskResult.allowed) {
       return { accepted: false, reason: riskResult.reason };
+    }
+
+    // Position check: close without position, or duplicate direction
+    const pos = realPositions.get(signal.symbol);
+
+    if (signal.action === 'close') {
+      if (!pos || pos.size <= 0) {
+        return { accepted: false, reason: 'NO_POSITION_TO_CLOSE' };
+      }
+    } else if (signal.action === 'long' || signal.action === 'short') {
+      if (pos && pos.size > 0 && pos.side === signal.action) {
+        return { accepted: false, reason: 'POSITION_ALREADY_OPEN' };
+      }
+    }
+
+    // 挂单检查：同一 symbol 有待成交订单，不再新挂
+    const pendingOrders = this.positionTracker.getOpenOrders();
+    for (const [_, order] of pendingOrders) {
+      if (order.symbol === signal.symbol) {
+        return { accepted: false, reason: 'PENDING_ORDER_EXISTS' };
+      }
     }
 
     // 通过队列（默认直接通过）
@@ -262,7 +392,15 @@ export class SignalRouter {
       expiresAt,
     };
 
-    const exchangeOrderId = await this.tradingWs.submitOrder(orderForSubmit);
+    const exchangeOrderId = await this.tradingWs.submitOrder(orderForSubmit).catch(err => {
+      console.error(`[SignalRouter] Order submission to GRVT failed (non-fatal):`, (err as Error).message);
+      return null;
+    });
+
+    if (!exchangeOrderId) {
+      console.warn(`[SignalRouter] Signal ${order.clientOrderId} accepted but order not submitted to GRVT`);
+      return { accepted: true, reason: 'ORDER_SUBMISSION_FAILED' };
+    }
 
     this.orderManager.updateStatus(order.clientOrderId, 'submitted', exchangeOrderId);
 
@@ -285,6 +423,19 @@ export class SignalRouter {
 
     this.riskEngine.updateShadowPosition(signal.symbol, signal.positionSize);
 
+    // 同步到 positionTracker
+    this.positionTracker['openOrders'].set(order.clientOrderId, {
+      orderId: exchangeOrderId,
+      symbol: order.symbol,
+      side: order.side,
+      size: order.size,
+      price: order.limitPrice,
+      stopLoss: order.stopLoss || undefined,
+      takeProfit: order.takeProfit || undefined,
+      status: 'submitted',
+      createdAt: Date.now(),
+    });
+
     console.log(`[SignalRouter] Order submitted: ${order.clientOrderId} -> ${exchangeOrderId}`);
 
     return { accepted: true, reason: '' };
@@ -306,11 +457,29 @@ export class SignalRouter {
     // 更新 Shadow Position 和持久化
     if (update.status === 'filled') {
       this.riskEngine.updateShadowPosition(order.symbol, 0);
+      this.positionTracker.onOrderFilled(order.symbol, order.side, order.size, parseFloat(String(order.limitPrice)));
+      this.positionTracker['openOrders'].delete(order.clientOrderId);
       this.sqliteStore.updatePosition(order.symbol, order.side === 'buy' ? 'long' : 'short', String(order.size), String(order.limitPrice));
       this.timeoutManager.cancel(order.clientOrderId);
+
+      if (order.stopLoss || order.takeProfit) {
+        this.sltpMonitor.addOrder({
+          orderId: order.orderId,
+          clientOrderId: order.clientOrderId,
+          symbol: order.symbol,
+          side: order.side === 'buy' ? 'long' : 'short',
+          size: order.size,
+          stopLoss: order.stopLoss ? parseFloat(String(order.stopLoss)) : undefined,
+          takeProfit: order.takeProfit ? parseFloat(String(order.takeProfit)) : undefined,
+          entryPrice: parseFloat(String(order.limitPrice)),
+          status: 'active',
+          createdAt: order.createdAt,
+        });
+      }
     } else if (update.status === 'cancelled' || update.status === 'rejected') {
       this.riskEngine.updateShadowPosition(order.symbol, 0);
       this.timeoutManager.cancel(order.clientOrderId);
+      this.positionTracker['openOrders'].delete(order.clientOrderId);
     }
 
     // 更新并保存订单
