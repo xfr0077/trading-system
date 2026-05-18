@@ -133,6 +133,8 @@ export class SignalRouter {
         order.updatedAt = now;
         this.sqliteStore.saveOrder(order);
         this.riskEngine.updateShadowPosition(order.symbol, 0);
+        // 从 positionTracker 中移除
+        this.positionTracker['openOrders'].delete(order.clientOrderId);
         expiredCount++;
       }
     }
@@ -140,8 +142,9 @@ export class SignalRouter {
       console.log(`[SignalRouter] Cleaned up ${expiredCount} expired orders`);
     }
 
-    // 同步数据库中的挂单到 positionTracker，防止重复下单
-    for (const order of openOrders) {
+    // 同步数据库中未过期的挂单到 positionTracker
+    const validOrders = openOrders.filter(o => !o.expiresAt || o.expiresAt >= now || o.status !== 'submitted');
+    for (const order of validOrders) {
       this.positionTracker['openOrders'].set(order.clientOrderId, {
         orderId: order.orderId || order.clientOrderId,
         symbol: order.symbol,
