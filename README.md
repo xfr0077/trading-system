@@ -1,0 +1,258 @@
+AI 自动化加密货币交易系统
+基于混合架构的 AI 驱动加密货币交易系统，VPS 端执行交易，本地端运行 AI 推理，通过 Tailscale 安全通信。
+
+架构概览
+┌─────────────────────────────────────────────────────────────────┐
+│                        本地 PC (AI 推理)                         │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────────┐   │
+│  │  特征工程     │→│  ONNX 模型    │→│  gRPC Client         │   │
+│  │ feature_eng  │  │ inference    │  │  (SignalClient)      │   │
+│  └──────────────┘  └──────────────┘  └──────────┬───────────┘   │
+└─────────────────────────────────────────────────┼───────────────┘
+                                                  │ Tailscale
+                                                  │ (加密隧道)
+                                                  ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                   VPS 香港 (交易执行)                            │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────────┐   │
+│  │  gRPC Server │→│  风控引擎     │→│  GRVT DEX 订单执行    │   │
+│  │ SignalRouter │  │ risk_engine  │  │  (AWS Tokyo)         │   │
+│  └──────────────┘  └──────────────┘  └──────────────────────┘   │
+│        │                                                        │
+│        ▼                                                        │
+│  ┌──────────────┐  ┌──────────────┐                             │
+│  │  Redis       │  │  SQLite WAL  │                             │
+│  │  (行情缓存)   │  │  (订单/持仓)  │                             │
+│  └──────────────┘  └──────────────┘                             │
+└─────────────────────────────────────────────────────────────────┘
+为什么选择混合架构？
+考量	方案	理由
+执行延迟	VPS 香港	GRVT 交易所位于 AWS Tokyo，香港 VPS 延迟 ~150ms，满足 1m/5m 时间帧交易需求
+推理算力	本地 PC	避免云端 GPU 成本，利用本地 CPU 运行 ONNX 模型（~10-30ms 推理延迟可接受）
+网络安全	Tailscale	绕过 GFW 和公共网络不稳定，提供端到端加密的虚拟局域网
+数据安全	本地推理	模型和交易策略保留在本地，不暴露给云端
+快速开始
+前置要求
+VPS 端: Docker & Docker Compose v2+, Node.js 20+
+本地端: Python 3.10+, Tailscale 客户端
+网络: 两端均安装并登录 Tailscale，确保可互相访问
+1. 克隆项目
+git clone <your-repo-url>
+cd trading-system
+2. 配置环境变量
+# 复制并编辑环境变量
+cp .env.example .env
+
+# 编辑 .env 文件，填入真实值
+# GRVT_API_KEY: 从 https://app.grvt.io 获取
+# GRVT_ENV: testnet（测试）或 mainnet（生产）
+# TAILSCALE_AI_IP: 本地 AI 设备的 Tailscale IP（通过 `tailscale status` 查看）
+3. 启动 VPS 端服务
+# 构建并启动 Docker 容器
+docker compose up -d --build
+
+# 查看服务状态
+docker compose ps
+
+# 查看日志
+docker compose logs -f ts-engine
+4. 配置本地 Python AI
+cd python-ai
+
+# 创建虚拟环境
+python -m venv .venv
+source .venv/bin/activate  # Windows: .venv\Scripts\activate
+
+# 安装依赖
+pip install -r requirements.txt
+
+# 生成 gRPC 代码
+python -m grpc_tools.protoc -I../proto --python_out=src/proto --grpc_python_out=src/proto ../proto/signal.proto
+
+# 复制并编辑环境变量
+cp .env.example .env
+5. 运行测试
+# TS Engine 单元测试
+cd ts-engine
+npm install
+npm test
+
+# Python AI 单元测试
+cd ../python-ai
+pytest tests/ -v
+
+# 端到端集成测试
+cd ..
+pytest tests/integration/ -v
+项目结构
+trading-system/
+├── proto/                          # gRPC Proto 定义
+│   └── signal.proto                # 信号服务接口定义
+├── ts-engine/                      # VPS 端 TypeScript 交易引擎
+│   ├── src/
+│   │   ├── index.ts                # 入口文件
+│   │   ├── config.ts               # 配置管理（环境变量校验）
+│   │   ├── signal-router.ts        # gRPC Server（信号去重、验证、风控集成）
+│   │   ├── risk-engine.ts          # 风控引擎（TTL/置信度/仓位/滑点/保证金/Shadow Position）
+│   │   ├── margin-monitor.ts       # 保证金监控（阈值预警、状态回调）
+│   │   ├── order-manager.ts        # 订单管理器（状态机、部分成交）
+│   │   └── market-data.ts          # GRVT 行情 WebSocket + Redis 写入
+│   ├── tests/                      # 单元测试
+│   ├── proto/                      # 生成的 gRPC TypeScript 代码
+│   ├── package.json
+│   ├── tsconfig.json
+│   ├── Dockerfile                  # 多阶段构建，非 root 用户运行
+│   └── .dockerignore
+├── python-ai/                      # 本地 Python AI 服务
+│   ├── src/
+│   │   ├── main.py                 # AI 服务主循环
+│   │   ├── config.py               # Pydantic 配置管理
+│   │   ├── redis_reader.py         # Redis Streams 消费者（跳尾机制）
+│   │   ├── feature_engine.py       # 特征工程（MA/RSI/MACD/布林带）
+│   │   ├── model_inference.py      # ONNX CPU 推理
+│   │   ├── signal_client.py        # gRPC Client（发送信号到 TS Engine）
+│   │   └── proto/                  # 生成的 gRPC Python 代码
+│   ├── tests/                      # 单元测试
+│   ├── requirements.txt
+│   └── .env.example
+├── tests/                          # 集成测试
+│   └── integration/
+│       ├── conftest.py             # 测试夹具（自动启动 TS Engine）
+│       └── test_e2e.py             # 端到端通信测试
+├── docker-compose.yml              # VPS 端服务编排（TS Engine + Redis）
+├── .env.example                    # 环境变量模板
+└── README.md
+核心组件
+gRPC 信号服务
+Proto 定义位于 proto/signal.proto，包含两个 RPC 方法：
+
+方法	请求	响应	说明
+SendSignal	TradingSignal	SignalAck	AI 发送交易信号到 TS Engine
+HealthCheck	HealthRequest	HealthResponse	健康检查
+TradingSignal 字段
+字段	类型	说明	示例
+signal_id	string	唯一信号 ID（UUID）	550e8400-e29b-41d4-a716-446655440000
+symbol	string	交易对	BTC_USDT_Perp
+action	string	操作类型：long/short/close	long
+stop_loss	double	止损价格	97000.0
+take_profit	double	止盈价格	100000.0
+confidence	double	置信度（0-100）	75.0
+position_size	double	仓位大小	0.01
+timestamp	int64	时间戳（毫秒）	1716000000000
+signal_price	double	信号触发价格	98500.0
+max_slippage_bps	int32	最大滑点（基点）	10
+TS Engine
+配置验证: 启动时校验必需环境变量（GRVT_API_KEY、GRVT_ENV、GRPC_PORT）
+信号去重: 5 分钟 TTL 窗口，自动清理过期信号 ID
+输入验证: 校验 action 合法性、confidence 范围、position_size 正数等
+gRPC 错误处理: 区分 INVALID_ARGUMENT、UNAVAILABLE、DEADLINE_EXCEEDED 等状态码
+风控引擎: TTL 校验、置信度、单笔仓位、滑点保护、保证金联动、Shadow Position
+订单管理: 状态机（pending → submitted → partially_filled → filled/cancelled/rejected）
+行情数据: GRVT WebSocket → Redis Streams → 内存价格缓存（0ms 滑点校验）
+保证金监控: 自动阈值计算（warning/critical）、状态变更回调
+Python AI Client
+参数校验: 发送前验证信号参数，避免无效请求
+错误处理: 捕获 gRPC 异常并转换为 SignalError
+连接管理: 支持同步/异步上下文管理器，自动关闭 channel
+Keepalive: 默认配置 gRPC 保活选项，防止连接静默断开
+部署指南
+VPS 端部署
+安装 Tailscale
+curl -fsSL https://tailscale.com/install.sh | sh
+tailscale up
+配置防火墙
+# 仅允许 Tailscale 网络访问 gRPC 端口
+ufw allow from 100.64.0.0/10 to any port 50051
+启动服务
+docker compose up -d --build
+docker compose logs -f
+本地 AI 端部署
+安装 Tailscale（同上）
+
+获取 VPS 的 Tailscale IP
+
+tailscale status
+# 找到 VPS 设备的 IP，如 100.x.x.x
+配置 .env
+TS_ENGINE_GRPC_URL=100.x.x.x:50051  # VPS 的 Tailscale IP + gRPC 端口
+运行 AI 服务
+cd python-ai
+python src/main.py
+开发指南
+添加新的 gRPC 方法
+编辑 proto/signal.proto
+重新生成代码：
+# TypeScript
+cd ts-engine && npm run proto:generate
+
+# Python
+cd python-ai && python -m grpc_tools.protoc -I../proto --python_out=src/proto --grpc_python_out=src/proto ../proto/signal.proto
+实现服务端逻辑（signal-router.ts）
+实现客户端方法（signal_client.py）
+编写测试
+运行单个测试
+# TypeScript
+cd ts-engine && npx jest tests/risk-engine.test.ts
+
+# Python
+cd python-ai && pytest tests/test_feature_engine.py -v
+
+# 集成测试
+pytest tests/integration/test_e2e.py -v
+环境变量
+TS Engine
+变量	必需	默认值	说明
+GRVT_API_KEY	✅	-	GRVT 交易所 API 密钥
+GRVT_ENV	-	testnet	运行环境：testnet 或 mainnet
+GRPC_PORT	-	50051	gRPC 服务监听端口
+REDIS_URL	-	redis://localhost:6379	Redis 连接字符串
+SQLITE_PATH	-	/data/trades.db	SQLite 数据库路径
+TAILSCALE_AI_IP	✅	-	本地 AI 的 Tailscale IP
+GRVT_MARKET_DATA_WS_URL	-	wss://market-data.dev.gravitymarkets.io/ws	GRVT 行情 WebSocket
+GRVT_TRADING_WS_URL	-	wss://trades.dev.gravitymarkets.io/ws	GRVT 交易 WebSocket
+MAX_POSITION_SIZE	-	0.1	单笔最大仓位
+MAX_DAILY_LOSS	-	500	每日最大亏损（USDT）
+MAX_CONCURRENT_SIGNALS	-	3	同一标的最大并发持仓
+MIN_CONFIDENCE	-	60.0	最低置信度阈值
+MAX_PRICE_DEVIATION_PCT	-	0.5	最大价格偏差百分比
+SIGNAL_TTL_MS	-	30000	信号有效期（毫秒）
+MARGIN_WARNING_THRESHOLD	-	0.7	保证金率预警阈值
+MARGIN_CRITICAL_THRESHOLD	-	0.9	保证金率强平阈值
+Python AI
+变量	必需	默认值	说明
+TS_ENGINE_GRPC_URL	-	localhost:50051	TS Engine gRPC 地址
+REDIS_URL	-	redis://localhost:6379	Redis 连接字符串
+MODEL_PATH	-	models/model.onnx	ONNX 模型路径
+FEATURE_WINDOW	-	100	K 线特征窗口大小
+CONFIDENCE_THRESHOLD	-	70.0	最低置信度阈值
+SYMBOLS	-	BTC_USDT_Perp	监控的交易对（逗号分隔）
+Phase 进度
+Phase 1 ✅ 已完成
+[x] 项目初始化与 Proto 定义
+[x] TS Engine 配置与日志系统
+[x] TS Engine 信号路由器 (gRPC Server)
+[x] Python AI gRPC Client
+[x] Docker Compose 配置 (VPS 端)
+[x] 集成测试 (端到端通信)
+Phase 2 ✅ 已完成
+[x] TS Engine 配置扩展（GRVT 端点、风控参数）
+[x] Risk Engine（风控引擎 + Shadow Position）
+[x] Margin Monitor（保证金监控 + 阈值预警）
+[x] Order Manager（订单状态机 + 部分成交）
+[x] Market Data（GRVT WebSocket + Redis + 内存缓存）
+[x] SignalRouter 集成风控和滑点校验
+[x] Python AI 配置管理（Pydantic）
+[x] Python AI Redis 行情消费者（跳尾机制）
+[x] Python AI 特征工程（MA/RSI/MACD/布林带）
+[x] Python AI ONNX 模型推理（CPU）
+[x] Python AI 主循环
+Phase 3 ✅ 已完成
+[x] GRVT TradingWS 实际下单（限价 + 市价，REST API，EIP-712 签名）
+[x] 订单超时取消（OrderTimeoutManager，支持重启恢复）
+[x] SQLite 持久化（订单 + 持仓 + 交易历史，WAL 模式）
+[x] GRVT WebSocket 实际连接（@wezzcoetzee/grvt SDK，自动重连）
+[x] 信号优先级队列预留接口（ISignalQueue）
+[x] 重启恢复：从 SQLite 恢复未完成订单的取消定时器
+[x] 竞态防护：终态订单拒收后置状态变更
+许可证
+MIT
