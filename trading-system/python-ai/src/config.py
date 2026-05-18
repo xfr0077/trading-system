@@ -6,6 +6,8 @@ class AIConfig(BaseModel):
     ts_engine_grpc_url: str = Field(default="localhost:50051")
     redis_url: str = Field(default="redis://localhost:6379")
     model_path: str = Field(default="models/model.onnx")
+
+    model_config = {'protected_namespaces': ()}
     feature_window: int = Field(default=100)
     confidence_threshold: float = Field(default=70.0)
     symbols: List[str] = Field(default=["BTC_USDT_Perp"])

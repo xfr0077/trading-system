@@ -1,10 +1,12 @@
+import { EGrvtEnvironment } from '@grvt/sdk';
 import { GrvtEnv } from '@wezzcoetzee/grvt';
 
 export interface Config {
   grvtApiKey: string;
   grvtPrivateKey: string;
   grvtTradingAccountId: string;
-  grvtEnv: GrvtEnv;
+  grvtEnv: EGrvtEnvironment;
+  grvtEnvCommunity: GrvtEnv;
   redisUrl: string;
   sqlitePath: string;
   grpcPort: number;
@@ -40,14 +42,6 @@ function validateNonNegativeNumber(value: number, name: string): number {
   return value;
 }
 
-function validateUrl(value: string, name: string, allowedPrefixes: string[]): string {
-  const isValid = allowedPrefixes.some(prefix => value.startsWith(prefix));
-  if (!isValid) {
-    throw new Error(`${name} must start with ${allowedPrefixes.join(' or ')}`);
-  }
-  return value;
-}
-
 export function loadConfig(): Config {
   const grvtApiKey = process.env.GRVT_API_KEY;
   if (!grvtApiKey) throw new Error('GRVT_API_KEY is required');
@@ -55,10 +49,12 @@ export function loadConfig(): Config {
   const grvtPrivateKey = process.env.GRVT_PRIVATE_KEY;
   if (!grvtPrivateKey) throw new Error('GRVT_PRIVATE_KEY is required');
 
-  const grvtTradingAccountId = process.env.GRVT_TRADING_ACCOUNT_ID || '';
+  const grvtTradingAccountId = process.env.GRVT_TRADING_ACCOUNT_ID;
+  if (!grvtTradingAccountId) throw new Error('GRVT_TRADING_ACCOUNT_ID is required');
 
   const grvtEnvRaw = process.env.GRVT_ENV || 'testnet';
   const grvtEnv = mapGrvtEnvironment(grvtEnvRaw);
+  const grvtEnvCommunity = mapGrvtEnvironmentCommunity(grvtEnvRaw);
 
   const symbols = (process.env.SYMBOLS || 'BTC_USDT_Perp,ETH_USDT_Perp').split(',').map(s => s.trim());
 
@@ -106,6 +102,7 @@ export function loadConfig(): Config {
     grvtPrivateKey,
     grvtTradingAccountId,
     grvtEnv,
+    grvtEnvCommunity,
     redisUrl: process.env.REDIS_URL || 'redis://localhost:6379',
     sqlitePath: process.env.SQLITE_PATH || '/data/trades.db',
     grpcPort: port,
@@ -122,7 +119,18 @@ export function loadConfig(): Config {
   };
 }
 
-function mapGrvtEnvironment(env: string): GrvtEnv {
+function mapGrvtEnvironment(env: string): EGrvtEnvironment {
+  const map: Record<string, EGrvtEnvironment> = {
+    'testnet': EGrvtEnvironment.TESTNET,
+    'prod': EGrvtEnvironment.PRODUCTION,
+    'production': EGrvtEnvironment.PRODUCTION,
+    'staging': EGrvtEnvironment.STAGING,
+    'dev': EGrvtEnvironment.DEV,
+  };
+  return map[env.toLowerCase()] || EGrvtEnvironment.TESTNET;
+}
+
+function mapGrvtEnvironmentCommunity(env: string): GrvtEnv {
   const map: Record<string, GrvtEnv> = {
     'testnet': GrvtEnv.TESTNET,
     'prod': GrvtEnv.PROD,

@@ -13,9 +13,16 @@ class ModelInference:
         self._input_name = self.session.get_inputs()[0].name
 
     def predict(self, features: np.ndarray) -> tuple:
-        result = self.session.run(None, {self._input_name: features})
-        action_idx = int(result[0]['action'][0])
-        confidence = float(result[0]['confidence'][0]) * 100
+        # features: (batch, features) -> reshape to (batch, 1, features) for LSTM
+        if features.ndim == 2:
+            features = features[:, np.newaxis, :]
+        result = self.session.run(None, {self._input_name: features.astype(np.float32)})
+        if isinstance(result[0], dict):
+            action_idx = int(result[0]['action'][0])
+            confidence = float(result[0]['confidence'][0]) * 100
+        else:
+            action_idx = int(result[0][0, 0])
+            confidence = float(result[1][0, 0]) * 100
 
         action = ACTION_MAP.get(action_idx)
 

@@ -1,5 +1,5 @@
 import Redis from 'ioredis';
-import { GrvtRawClient, GrvtEnv, WebSocketTransport, buildTickerFeed } from '@wezzcoetzee/grvt';
+import { GrvtEnv, WebSocketTransport, buildTickerFeed } from '@wezzcoetzee/grvt';
 
 export interface MarketData {
   symbol: string;
@@ -18,13 +18,14 @@ export interface MarketDataConfig {
 
 export class MarketDataStream {
   private redis: Redis;
-  private rawClient: GrvtRawClient | null = null;
   private ws: WebSocketTransport | null = null;
   private config: MarketDataConfig;
   private latestPrices = new Map<string, MarketData>();
   private reconnectAttempts = 0;
   private maxReconnectAttempts = 10;
   private reconnectTimer: NodeJS.Timeout | null = null;
+  private subscriptions: Array<{ unsubscribe: () => Promise<void> }> = [];
+  private priceCallbacks: Array<(data: MarketData) => void> = [];
 
   constructor(config: MarketDataConfig, redis: Redis) {
     this.config = config;
@@ -32,25 +33,18 @@ export class MarketDataStream {
   }
 
   async connect(): Promise<void> {
-    // 初始化 RawClient（用于 REST 查询）
-    this.rawClient = new GrvtRawClient({
-      env: this.config.env,
-      apiKey: this.config.apiKey,
-    });
-
-    // 初始化 WebSocket（实时行情推送）
     try {
       this.ws = new WebSocketTransport({
         env: this.config.env,
       });
       await this.ws.ready();
 
-      this.ws.onClose(() => {
+      this.ws.socket.addEventListener('close', () => {
         console.log('[MarketData] WebSocket closed, scheduling reconnect');
         this.scheduleReconnect();
       });
 
-      this.subscribeToTickers();
+      await this.subscribeToTickers();
 
       console.log('[MarketData] Connected');
     } catch (err) {
@@ -58,18 +52,20 @@ export class MarketDataStream {
     }
   }
 
-  private subscribeToTickers(): void {
+  private async subscribeToTickers(): Promise<void> {
     if (!this.ws) return;
 
+    this.subscriptions = [];
+
     for (const symbol of this.config.symbols) {
-      // 订阅 Ticker 推送
-      this.ws.subscribe(
+      const sub = await this.ws.subscribe(
         'ticker.s',
         buildTickerFeed(symbol, '500'),
         (data: any) => {
           this.handleTickerData(data);
         }
       );
+      this.subscriptions.push(sub);
     }
 
     console.log(`[MarketData] Subscribed to tickers: ${this.config.symbols.join(', ')}`);
@@ -85,6 +81,7 @@ export class MarketDataStream {
     this.reconnectTimer = setTimeout(async () => {
       try {
         await this.connect();
+        this.reconnectAttempts = 0;
       } catch (err) {
         this.scheduleReconnect();
       }
@@ -95,6 +92,13 @@ export class MarketDataStream {
     const data = this.parseTickerData(rawData);
     this.latestPrices.set(data.symbol, data);
     this.writeToRedis(data);
+    for (const cb of this.priceCallbacks) {
+      cb(data);
+    }
+  }
+
+  onPriceUpdate(callback: (data: MarketData) => void): void {
+    this.priceCallbacks.push(callback);
   }
 
   parseTickerData(raw: any): MarketData {
@@ -141,6 +145,10 @@ export class MarketDataStream {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
     }
+    for (const sub of this.subscriptions) {
+      await sub.unsubscribe().catch(() => {});
+    }
+    this.subscriptions = [];
     if (this.ws) {
       await this.ws.close().catch(() => {});
       this.ws = null;

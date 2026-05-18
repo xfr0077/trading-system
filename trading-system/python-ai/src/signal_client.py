@@ -1,9 +1,11 @@
+import sys, os
 import uuid
 import time
 import grpc
 from typing import Optional
 from dataclasses import dataclass
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from proto import signal_pb2
 from proto import signal_pb2_grpc
 
@@ -61,10 +63,10 @@ class SignalClient:
             raise ValueError(f"confidence must be between 0 and 100, got {confidence}")
         if position_size <= 0:
             raise ValueError(f"position_size must be positive, got {position_size}")
-        if stop_loss <= 0:
-            raise ValueError(f"stop_loss must be positive, got {stop_loss}")
-        if take_profit <= 0:
-            raise ValueError(f"take_profit must be positive, got {take_profit}")
+        if stop_loss < 0:
+            raise ValueError(f"stop_loss must be non-negative, got {stop_loss}")
+        if take_profit < 0:
+            raise ValueError(f"take_profit must be non-negative, got {take_profit}")
         if signal_price <= 0:
             raise ValueError(f"signal_price must be positive, got {signal_price}")
 

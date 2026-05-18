@@ -14,7 +14,7 @@ class MarketData:
     timestamp: int  # Unix 毫秒
 
 class RedisMarketReader:
-    _BACKLOG_THRESHOLD_MS = 1000  # 积压阈值：超过 1 秒则跳尾
+    _BACKLOG_THRESHOLD_MS = 86400000  # 24h threshold: if data older than 24h, skip
 
     def __init__(self, redis_url: str, symbols: List[str]):
         self._redis_url = redis_url
@@ -58,7 +58,8 @@ class RedisMarketReader:
 
                         # 跳尾机制：检查积压程度
                         now_ms = int(time.time() * 1000)
-                        if now_ms - data.timestamp > self._BACKLOG_THRESHOLD_MS:
+                        age = now_ms - data.timestamp
+                        if abs(age) > self._BACKLOG_THRESHOLD_MS:
                             # 积压严重，跳到流尾部
                             self._last_ids[symbol] = "$"
                             await asyncio.sleep(0)  # yield to event loop

@@ -60,6 +60,7 @@ export class SignalRouter {
   private seenSignals = new Map<string, number>();
   private readonly TTL_MS = 5 * 60 * 1000;
   private cleanupInterval: NodeJS.Timeout | null = null;
+  private orderStatusPollInterval: NodeJS.Timeout | null = null;
   private riskEngine: RiskEngine;
   private marginMonitor: MarginMonitor;
   private marketData: MarketDataStream | null = null;
@@ -208,6 +209,82 @@ export class SignalRouter {
 
     // 加载 instruments
     await this.loadInstruments();
+
+    // 启动订单状态轮询（REST API 无推送，需主动查询）
+    this.startOrderStatusPolling();
+  }
+
+  private startOrderStatusPolling(): void {
+    this.orderStatusPollInterval = setInterval(async () => {
+      try {
+        const submittedOrders = this.sqliteStore.getOpenOrders().filter(o => o.status === 'submitted');
+        if (submittedOrders.length === 0) return;
+
+        const exchangeOrders = await this.tradingWs.getOpenOrders();
+        const exchangeOrderMap = new Map<string, any>();
+        for (const o of exchangeOrders) {
+          exchangeOrderMap.set(o.client_order_id || o.order_id, o);
+        }
+
+        const positions = await this.tradingWs.getPositions();
+        const positionMap = new Map<string, any>();
+        for (const p of positions) {
+          positionMap.set(p.symbol, p);
+        }
+
+        for (const localOrder of submittedOrders) {
+          const exchangeOrder = exchangeOrderMap.get(localOrder.clientOrderId);
+          if (exchangeOrder) {
+            const newStatus = this.mapExchangeStatus(exchangeOrder.status);
+            if (newStatus !== localOrder.status) {
+              this.handleOrderUpdate({
+                clientOrderId: localOrder.clientOrderId,
+                orderId: exchangeOrder.order_id || localOrder.orderId,
+                status: newStatus,
+                fee: String(exchangeOrder.fee || '0'),
+              });
+            }
+          } else {
+            // 交易所查不到，检查是否有对应持仓来判断是否成交
+            const position = positionMap.get(localOrder.symbol);
+            if (position && parseFloat(position.size) > 0) {
+              console.log(`[SignalRouter] Order ${localOrder.clientOrderId} likely filled (position exists for ${localOrder.symbol})`);
+              this.handleOrderUpdate({
+                clientOrderId: localOrder.clientOrderId,
+                orderId: localOrder.orderId,
+                status: 'filled',
+                fee: '0',
+              });
+            } else {
+              // 无持仓且不在挂单中，可能已取消或过期
+              console.log(`[SignalRouter] Order ${localOrder.clientOrderId} not found in open orders, marking as cancelled`);
+              this.handleOrderUpdate({
+                clientOrderId: localOrder.clientOrderId,
+                orderId: localOrder.orderId,
+                status: 'cancelled',
+                fee: '0',
+              });
+            }
+          }
+        }
+      } catch (err) {
+        console.error('[SignalRouter] Order status polling error:', err);
+      }
+    }, 5000);
+    this.orderStatusPollInterval.unref();
+  }
+
+  private mapExchangeStatus(status: string): 'pending' | 'submitted' | 'filled' | 'cancelled' | 'rejected' | 'partially_filled' {
+    const map: Record<string, 'pending' | 'submitted' | 'filled' | 'cancelled' | 'rejected' | 'partially_filled'> = {
+      'open': 'submitted',
+      'new': 'submitted',
+      'partially_filled': 'partially_filled',
+      'filled': 'filled',
+      'cancelled': 'cancelled',
+      'rejected': 'rejected',
+      'expired': 'cancelled',
+    };
+    return map[status] || 'submitted';
   }
 
   private async loadInstruments(): Promise<void> {
@@ -600,6 +677,10 @@ export class SignalRouter {
     if (this.cleanupInterval) {
       clearInterval(this.cleanupInterval);
       this.cleanupInterval = null;
+    }
+    if (this.orderStatusPollInterval) {
+      clearInterval(this.orderStatusPollInterval);
+      this.orderStatusPollInterval = null;
     }
     this.timeoutManager.clearAll();
     this.tradingWs.disconnect();

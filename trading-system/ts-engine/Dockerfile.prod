@@ -1,0 +1,30 @@
+FROM node:20-alpine AS builder
+
+RUN apk add --no-cache python3 build-base
+
+WORKDIR /app
+
+COPY ts-engine/package.json ts-engine/package-lock.json* ./
+RUN npm ci
+
+COPY ts-engine/src/ ./src/
+COPY ts-engine/tsconfig.json ./
+COPY proto/ ./proto/
+
+RUN npm run build
+
+FROM node:20-alpine
+
+RUN addgroup -S appgroup && adduser -S appuser -G appgroup && mkdir -p /data && chown appuser:appgroup /data
+
+WORKDIR /app
+
+COPY --from=builder /app/node_modules ./node_modules
+COPY --from=builder /app/dist ./dist
+COPY proto ./proto
+
+USER appuser
+
+EXPOSE 50051
+
+CMD ["node", "dist/index.js"]
