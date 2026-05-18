@@ -142,6 +142,13 @@ export class SqliteStore {
     }));
   }
 
+  getFilledOrdersWithSLTP(): Order[] {
+    const rows = this.db.prepare(
+      "SELECT * FROM orders WHERE status = 'filled' AND (stop_loss IS NOT NULL OR take_profit IS NOT NULL) AND (stop_loss != '0' OR take_profit != '0')"
+    ).all() as any[];
+    return rows.map(this.mapRowToOrder);
+  }
+
   updatePosition(symbol: string, side: 'long' | 'short', size: string, entryPrice: string): void {
     this.db.prepare(`
       INSERT INTO positions (symbol, side, size, entry_price, updated_at)

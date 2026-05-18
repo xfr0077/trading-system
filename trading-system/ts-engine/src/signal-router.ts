@@ -119,6 +119,27 @@ export class SignalRouter {
     });
     console.log(`[SignalRouter] Restored ${openOrders.length} pending orders from database`);
 
+    // 清理过期订单
+    const now = Date.now();
+    let expiredCount = 0;
+    for (const order of openOrders) {
+      if (order.expiresAt && order.expiresAt < now && order.status === 'submitted') {
+        // 取消交易所订单
+        if (order.orderId) {
+          await this.tradingWs.cancelOrder(order.orderId).catch(() => {});
+        }
+        // 更新本地状态
+        order.status = 'cancelled';
+        order.updatedAt = now;
+        this.sqliteStore.saveOrder(order);
+        this.riskEngine.updateShadowPosition(order.symbol, 0);
+        expiredCount++;
+      }
+    }
+    if (expiredCount > 0) {
+      console.log(`[SignalRouter] Cleaned up ${expiredCount} expired orders`);
+    }
+
     // 同步数据库中的挂单到 positionTracker，防止重复下单
     for (const order of openOrders) {
       this.positionTracker['openOrders'].set(order.clientOrderId, {
@@ -135,6 +156,26 @@ export class SignalRouter {
     }
     if (openOrders.length > 0) {
       console.log(`[SignalRouter] Synced ${openOrders.length} open orders to positionTracker`);
+    }
+
+    // 从数据库恢复 SLTP 监控（之前成交的订单）
+    const filledOrders = this.sqliteStore.getFilledOrdersWithSLTP();
+    for (const order of filledOrders) {
+      this.sltpMonitor.addOrder({
+        orderId: order.orderId,
+        clientOrderId: order.clientOrderId,
+        symbol: order.symbol,
+        side: order.side === 'buy' ? 'long' : 'short',
+        size: parseFloat(order.size),
+        stopLoss: order.stopLoss && order.stopLoss !== '0' ? parseFloat(order.stopLoss) : undefined,
+        takeProfit: order.takeProfit && order.takeProfit !== '0' ? parseFloat(order.takeProfit) : undefined,
+        entryPrice: parseFloat(order.limitPrice),
+        status: 'active',
+        createdAt: order.createdAt,
+      });
+    }
+    if (filledOrders.length > 0) {
+      console.log(`[SignalRouter] Restored ${filledOrders.length} SLTP monitors from database`);
     }
 
     // 连接 TradingWS
