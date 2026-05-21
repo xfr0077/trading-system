@@ -14,7 +14,13 @@ test-*.ts
 
 # Environment files
 .env
+**/.env
+.env.vps
+**/.env.vps
+*.env.local
 !.env.example
+!**/.env.example
+!**/.env.production.example
 
 # OS
 .DS_Store
@@ -26,3 +32,7 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Training artifacts (not needed in repo)
+*.pkl
+training_data.pkl

@@ -14,13 +14,16 @@ class MarketData:
     timestamp: int  # Unix 毫秒
 
 class RedisMarketReader:
-    _BACKLOG_THRESHOLD_MS = 86400000  # 24h threshold: if data older than 24h, skip
+    _BACKLOG_THRESHOLD_MS = 1000  # Maximum acceptable age (ms) for market data messages
+    _MAX_RECONNECT_DELAY = 60.0
+    _BASE_RECONNECT_DELAY = 1.0
 
     def __init__(self, redis_url: str, symbols: List[str]):
         self._redis_url = redis_url
         self._symbols = symbols
         self._redis: Optional[aioredis.Redis] = None
         self._last_ids: dict[str, str] = {s: "$" for s in symbols}
+        self._reconnect_attempt = 0
 
     async def _connect(self):
         if self._redis is None:
@@ -69,9 +72,13 @@ class RedisMarketReader:
                         yield data
 
             except aioredis.ConnectionError:
-                # 断线后重连，重置到最新
+                # 断线后重连，指数退避
+                self._reconnect_attempt += 1
+                delay = min(self._BASE_RECONNECT_DELAY * (2 ** (self._reconnect_attempt - 1)), self._MAX_RECONNECT_DELAY)
+                logger = __import__('logging').getLogger(__name__)
+                logger.warning(f"[RedisReader] Connection lost, retrying in {delay:.1f}s (attempt {self._reconnect_attempt})")
+                await asyncio.sleep(delay)
                 for symbol in self._symbols:
                     self._last_ids[symbol] = "$"
-                await asyncio.sleep(1)
                 self._redis = None
                 await self._connect()

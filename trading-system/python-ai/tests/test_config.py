@@ -10,6 +10,8 @@ def test_default_config():
     assert config.feature_window == 100
     assert config.confidence_threshold == 70.0
     assert config.symbols == ["BTC_USDT_Perp"]
+    assert config.position_size == 0.01
+    assert config.max_slippage_bps == 10
 
 def test_config_from_env(monkeypatch):
     monkeypatch.setenv("TS_ENGINE_GRPC_URL", "100.1.2.3:50051")
@@ -28,3 +30,11 @@ def test_invalid_grpc_url():
 def test_invalid_confidence_threshold():
     with pytest.raises(ValueError):
         AIConfig(confidence_threshold=150.0)
+
+def test_config_position_size_from_env(monkeypatch):
+    monkeypatch.setenv("POSITION_SIZE", "0.05")
+    monkeypatch.setenv("MAX_SLIPPAGE_BPS", "20")
+
+    config = AIConfig.from_env()
+    assert config.position_size == 0.05
+    assert config.max_slippage_bps == 20

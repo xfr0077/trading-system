@@ -84,25 +84,41 @@ export class PositionTracker {
   onOrderCancelled(symbol: string, side: 'buy' | 'sell', size: number): void {
   }
 
+  addOpenOrder(clientOrderId: string, data: OpenOrderData): void {
+    this.openOrders.set(clientOrderId, data);
+  }
+
+  removeOpenOrder(clientOrderId: string): void {
+    this.openOrders.delete(clientOrderId);
+  }
+
+  hasOpenOrder(clientOrderId: string): boolean {
+    return this.openOrders.has(clientOrderId);
+  }
+
   onUpdate(callback: (positions: Map<string, PositionData>, openOrders: Map<string, OpenOrderData>) => void): void {
     this.listeners.push(callback);
   }
 
   sync(rawPositions: Position[], rawOrders: any[]): void {
     console.log('[PositionTracker] sync() raw positions:', JSON.stringify(rawPositions));
-    this.positions.clear();
-    for (const p of rawPositions) {
-      const size = Math.abs(parseFloat(p.size || '0'));
-      if (size > 0) {
-        this.positions.set(p.symbol, {
-          symbol: p.symbol,
-          side: parseFloat(p.size) < 0 ? 'short' : 'long',
-          size,
-          entryPrice: parseFloat(p.entryPrice || '0'),
-          unrealizedPnl: parseFloat(p.unrealizedPnl || '0'),
-          realizedPnl: parseFloat(p.realizedPnl || '0'),
-          updatedAt: p.updatedAt || Date.now(),
-        });
+    if (rawPositions.length === 0) {
+      console.log('[PositionTracker] GRVT returned empty positions, preserving local tracking');
+    } else {
+      this.positions.clear();
+      for (const p of rawPositions) {
+        const size = Math.abs(parseFloat(p.size || '0'));
+        if (size > 0) {
+          this.positions.set(p.symbol, {
+            symbol: p.symbol,
+            side: parseFloat(p.size) < 0 ? 'short' : 'long',
+            size,
+            entryPrice: parseFloat(p.entryPrice || '0'),
+            unrealizedPnl: parseFloat(p.unrealizedPnl || '0'),
+            realizedPnl: parseFloat(p.realizedPnl || '0'),
+            updatedAt: p.updatedAt || Date.now(),
+          });
+        }
       }
     }
     // 合并交易所订单和本地订单，不清空本地提交的订单

@@ -1,36 +1,18 @@
 import { SignalRouter } from '../src/signal-router';
 import { Config } from '../src/config';
 import { MarketDataStream } from '../src/market-data';
-import { EGrvtEnvironment } from '@grvt/sdk';
-import { GrvtEnv } from '@wezzcoetzee/grvt';
-
-// Mock TradingWebSocket
-jest.mock('../src/trading-ws', () => {
-  return {
-    TradingWebSocket: jest.fn().mockImplementation(() => ({
-      connect: jest.fn().mockResolvedValue(undefined),
-      submitOrder: jest.fn().mockResolvedValue('exchange-order-1'),
-      cancelOrder: jest.fn().mockResolvedValue(undefined),
-      getInstruments: jest.fn().mockResolvedValue([]),
-      addInstrument: jest.fn(),
-      onOrderUpdate: jest.fn(),
-      disconnect: jest.fn(),
-    })),
-  };
-});
 
 function createMockConfig(overrides = {}): Config {
   return {
-    grvtApiKey: 'test-key',
-    grvtPrivateKey: '0xtest-secret',
-    grvtTradingAccountId: 'test-account',
-    grvtEnv: EGrvtEnvironment.TESTNET,
-    grvtEnvCommunity: GrvtEnv.TESTNET,
+    privateKey: '0xtest-secret',
+    env: 'testnet',
+    dexProvider: 'lighter',
     redisUrl: 'redis://localhost:6379',
-    sqlitePath: '/tmp/test.db',
+    sqlitePath: 'C:\\Users\\Administrator\\AppData\\Local\\Temp\\test-signal-router.db',
     grpcPort: 0,
+    dashboardPort: 3000,
     tailscaleAiIp: '127.0.0.1',
-    symbols: ['BTC_USDT_Perp'],
+    symbols: ['BTC_USDT_Perp', 'ETH_USDT_Perp'],
     maxPositionSize: 1,
     maxDailyLoss: 500,
     maxConcurrentSignals: 3,
@@ -120,16 +102,16 @@ describe('SignalRouter', () => {
 
     test('should reject confidence out of range (negative)', async () => {
       const signal = createValidSignal({ confidence: -1 });
-      await expect(router.handleSignal(signal)).rejects.toThrow(
-        'INVALID_ARGUMENT: confidence must be between 0 and 100',
-      );
+      const ack = await router.handleSignal(signal);
+      expect(ack.accepted).toBe(false);
+      expect(ack.reason).toBe('INVALID_CONFIDENCE');
     });
 
     test('should reject confidence out of range (over 100)', async () => {
       const signal = createValidSignal({ confidence: 101 });
-      await expect(router.handleSignal(signal)).rejects.toThrow(
-        'INVALID_ARGUMENT: confidence must be between 0 and 100',
-      );
+      const ack = await router.handleSignal(signal);
+      expect(ack.accepted).toBe(false);
+      expect(ack.reason).toBe('INVALID_CONFIDENCE');
     });
 
     test('should reject non-positive positionSize', async () => {
@@ -168,18 +150,77 @@ describe('SignalRouter', () => {
     });
 
     test('should accept long and short actions', async () => {
-      for (const action of ['long', 'short']) {
-        const signal = createValidSignal({ signalId: `action-${action}`, action });
-        const ack = await router.handleSignal(signal);
-        expect(ack.accepted).toBe(true);
-      }
+      const ack1 = await router.handleSignal(createValidSignal({ signalId: 'action-long', action: 'long' }));
+      expect(ack1.accepted).toBe(true);
+      // 第二个信号用不同 symbol，避免 PENDING_ORDER_EXISTS
+      const ack2 = await router.handleSignal(createValidSignal({
+        signalId: 'action-short', action: 'short', symbol: 'ETH_USDT_Perp',
+        stopLoss: 100000, takeProfit: 97000, signalPrice: 98500,
+      }));
+      expect(ack2.accepted).toBe(true);
     });
 
     test('should reject close when no position exists', async () => {
-      const signal = createValidSignal({ signalId: 'action-close', action: 'close' });
+      const signal = createValidSignal({ signalId: 'action-close', action: 'close', stopLoss: 0, takeProfit: 0 });
       const ack = await router.handleSignal(signal);
       expect(ack.accepted).toBe(false);
       expect(ack.reason).toBe('NO_POSITION_TO_CLOSE');
+    });
+
+    test('should reject symbol not in whitelist', async () => {
+      const signal = createValidSignal({ symbol: 'DOGE_USDT_Perp' });
+      const ack = await router.handleSignal(signal);
+      expect(ack.accepted).toBe(false);
+      expect(ack.reason).toBe('INVALID_SYMBOL');
+    });
+
+    test('should reject long signal with stopLoss >= signalPrice', async () => {
+      const signal = createValidSignal({ action: 'long', stopLoss: 99000, signalPrice: 98500, takeProfit: 100000 });
+      const ack = await router.handleSignal(signal);
+      expect(ack.accepted).toBe(false);
+      expect(ack.reason).toBe('INVALID_SL_TP');
+    });
+
+    test('should reject long signal with signalPrice >= takeProfit', async () => {
+      const signal = createValidSignal({ action: 'long', stopLoss: 97000, signalPrice: 100500, takeProfit: 100000 });
+      const ack = await router.handleSignal(signal);
+      expect(ack.accepted).toBe(false);
+      expect(ack.reason).toBe('INVALID_SL_TP');
+    });
+
+    test('should reject short signal with takeProfit >= signalPrice', async () => {
+      const signal = createValidSignal({ action: 'short', stopLoss: 100000, signalPrice: 98500, takeProfit: 99000 });
+      const ack = await router.handleSignal(signal);
+      expect(ack.accepted).toBe(false);
+      expect(ack.reason).toBe('INVALID_SL_TP');
+    });
+
+    test('should reject short signal with signalPrice >= stopLoss', async () => {
+      const signal = createValidSignal({ action: 'short', stopLoss: 98000, signalPrice: 98500, takeProfit: 97000 });
+      const ack = await router.handleSignal(signal);
+      expect(ack.accepted).toBe(false);
+      expect(ack.reason).toBe('INVALID_SL_TP');
+    });
+
+    test('should accept close action with stopLoss and takeProfit as 0', async () => {
+      // close action skips SL/TP > 0 check and direction validation
+      const signal = createValidSignal({ signalId: 'close-zero', action: 'close', stopLoss: 0, takeProfit: 0 });
+      // Will be rejected for NO_POSITION_TO_CLOSE (no open position), but NOT for SL/TP validation
+      const ack = await router.handleSignal(signal);
+      expect(ack.accepted).toBe(false);
+      expect(ack.reason).toBe('NO_POSITION_TO_CLOSE');
+    });
+
+    test('should accept confidence at boundary values (0 and 100)', async () => {
+      const signal0 = createValidSignal({ signalId: 'conf-0', confidence: 0 });
+      const ack0 = await router.handleSignal(signal0);
+      // Confidence 0 passes the range check but may be rejected by risk engine (minConfidence=60)
+      // The important thing is it does NOT get INVALID_CONFIDENCE
+      expect(ack0.reason).not.toBe('INVALID_CONFIDENCE');
+
+      const signal100 = createValidSignal({ signalId: 'conf-100', confidence: 100 });
+      const ack100 = await router.handleSignal(signal100);
+      expect(ack100.reason).not.toBe('INVALID_CONFIDENCE');
     });
   });
 

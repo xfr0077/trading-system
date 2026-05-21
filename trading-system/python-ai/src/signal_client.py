@@ -35,6 +35,8 @@ class SignalClient:
         stub: Optional[signal_pb2_grpc.SignalServiceStub] = None,
         target: str = "localhost:50051",
         channel_options: Optional[list] = None,
+        use_tls: bool = False,
+        tls_ca_path: Optional[str] = None,
     ):
         self._owns_channel = stub is None
         if stub:
@@ -42,7 +44,15 @@ class SignalClient:
             self.channel = None
         else:
             options = channel_options if channel_options is not None else self._DEFAULT_CHANNEL_OPTIONS
-            self.channel = grpc.insecure_channel(target, options=options)
+            if use_tls:
+                ca_cert = None
+                if tls_ca_path:
+                    with open(tls_ca_path, 'rb') as f:
+                        ca_cert = f.read()
+                credentials = grpc.ssl_channel_credentials(root_certificates=ca_cert)
+                self.channel = grpc.secure_channel(target, credentials, options=options)
+            else:
+                self.channel = grpc.insecure_channel(target, options=options)
             self.stub = signal_pb2_grpc.SignalServiceStub(self.channel)
 
     def _validate_signal(

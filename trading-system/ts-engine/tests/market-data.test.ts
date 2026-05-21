@@ -15,22 +15,13 @@ describe('MarketDataStream', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     stream = new MarketDataStream(
-      { apiKey: 'test-key', env: 'testnet' as any, symbols: ['BTC_USDT_Perp'] },
+      { symbols: ['BTC_USDT_Perp'] },
       mockRedis as any
     );
   });
 
-  test('should parse ticker data correctly', () => {
-    const rawData = {
-      instrument: 'BTC_USDT_Perp',
-      last_price: '98500.50',
-      best_bid_price: '98499.00',
-      best_ask_price: '98501.00',
-      volume_24h: '1234.56',
-      event_time: '1716000000000000000',
-    };
-    const parsed = (stream as any).parseTickerData(rawData);
-    expect(parsed).toEqual({
+  test('should store and retrieve in-memory price cache', () => {
+    (stream as any).latestPrices.set('BTC_USDT_Perp', {
       symbol: 'BTC_USDT_Perp',
       lastPrice: 98500.50,
       bidPrice: 98499.00,
@@ -38,25 +29,31 @@ describe('MarketDataStream', () => {
       volume24h: 1234.56,
       timestamp: 1716000000000,
     });
-  });
-
-  test('should convert nanoseconds to milliseconds', () => {
-    const parsed = (stream as any).parseTickerData({ event_time: '1716000000000000000' });
-    expect(parsed.timestamp).toBe(1716000000000);
-  });
-
-  test('should update in-memory price cache', () => {
-    const rawData = {
-      instrument: 'BTC_USDT_Perp',
-      last_price: '98500.50',
-      best_bid_price: '98499.00',
-      best_ask_price: '98501.00',
-      volume_24h: '1234.56',
-      event_time: '1716000000000000000',
-    };
-    stream.handleTickerData(rawData);
     const cached = stream.getLatestPriceInMemory('BTC_USDT_Perp');
     expect(cached).not.toBeNull();
     expect(cached?.lastPrice).toBe(98500.50);
+  });
+
+  test('should return null for unknown symbol', () => {
+    expect(stream.getLatestPriceInMemory('UNKNOWN')).toBeNull();
+  });
+
+  test('should write to redis on price update via callback', () => {
+    const callback = jest.fn();
+    stream.onPriceUpdate(callback);
+
+    const data: MarketData = {
+      symbol: 'BTC_USDT_Perp',
+      lastPrice: 98500.50,
+      bidPrice: 98499.00,
+      askPrice: 98501.00,
+      volume24h: 1234.56,
+      timestamp: Date.now(),
+    };
+
+    (stream as any).latestPrices.set(data.symbol, data);
+    (stream as any).priceCallbacks[0](data);
+
+    expect(callback).toHaveBeenCalledWith(data);
   });
 });

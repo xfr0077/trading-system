@@ -5,15 +5,11 @@ import { loadConfig } from './config';
 
 dotenv.config();
 
-// Polyfill WebSocket for Node 20 (used by @wezzcoetzee/grvt)
+// Polyfill WebSocket for Node 20
 if (typeof globalThis.WebSocket === 'undefined') {
   const { WebSocket } = require('ws');
   (globalThis as any).WebSocket = WebSocket;
 }
-
-// Proxy support for GRVT trading API (bypass geo-restriction)
-import { configureProxy } from './trading-ws';
-configureProxy();
 
 async function main() {
   const config = loadConfig();
@@ -26,8 +22,11 @@ async function main() {
     console.error('[Main] Market data init failed (non-fatal):', err);
   }
 
-  const server = await router.startServer(config.grpcPort);
-  console.log(`TS Engine started on port ${config.grpcPort} (env: ${config.grvtEnv})`);
+  const server = await router.startServer(config.grpcPort, config.grpcTlsEnabled);
+  console.log(`TS Engine started on port ${config.grpcPort} (dex: ${config.dexProvider}, env: ${config.env})`);
+
+  const { startDashboard } = await import('./dashboard');
+  startDashboard(router, config.dashboardPort, config);
 
   // Background init with exponential backoff retry
   (async function retryInit() {

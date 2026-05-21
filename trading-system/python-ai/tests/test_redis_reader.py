@@ -38,8 +38,8 @@ async def test_parse_market_data(mock_redis):
 
 @pytest.mark.asyncio
 async def test_skip_backlog_on_reconnect():
-    """测试断线重连后跳过积压数据"""
-    old_timestamp = int(time.time() * 1000) - 5000  # 5 秒前
+    """测试跳过超过阈值(1s)的积压数据"""
+    old_timestamp = int(time.time() * 1000) - 2000  # 2 seconds old, exceeds 1s threshold
     reader = RedisMarketReader("redis://localhost:6379", ["BTC_USDT_Perp"])
 
     mock_redis = AsyncMock()
@@ -57,7 +57,7 @@ async def test_skip_backlog_on_reconnect():
     ])
     reader._redis = mock_redis
 
-    # 积压超过 1 秒，应跳过
+    # 积压超过 1s 阈值，应跳过
     # 使用 wait_for 超时验证没有数据被 yield
     stream = reader.stream()
     with pytest.raises(asyncio.TimeoutError):

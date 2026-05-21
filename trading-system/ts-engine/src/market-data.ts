@@ -1,5 +1,5 @@
 import Redis from 'ioredis';
-import { GrvtEnv, WebSocketTransport, buildTickerFeed } from '@wezzcoetzee/grvt';
+import { IDexAdapter } from './dex';
 
 export interface MarketData {
   symbol: string;
@@ -11,115 +11,76 @@ export interface MarketData {
 }
 
 export interface MarketDataConfig {
-  apiKey: string;
-  env: GrvtEnv;
   symbols: string[];
 }
 
 export class MarketDataStream {
   private redis: Redis;
-  private ws: WebSocketTransport | null = null;
   private config: MarketDataConfig;
   private latestPrices = new Map<string, MarketData>();
-  private reconnectAttempts = 0;
-  private maxReconnectAttempts = 10;
-  private reconnectTimer: NodeJS.Timeout | null = null;
-  private subscriptions: Array<{ unsubscribe: () => Promise<void> }> = [];
+  private pollingInterval: NodeJS.Timeout | null = null;
   private priceCallbacks: Array<(data: MarketData) => void> = [];
+  private dexAdapter: IDexAdapter | null = null;
 
-  constructor(config: MarketDataConfig, redis: Redis) {
+  constructor(config: MarketDataConfig, redis: Redis, dexAdapter?: IDexAdapter) {
     this.config = config;
     this.redis = redis;
+    this.dexAdapter = dexAdapter || null;
   }
 
   async connect(): Promise<void> {
-    try {
-      this.ws = new WebSocketTransport({
-        env: this.config.env,
-      });
-      await this.ws.ready();
-
-      this.ws.socket.addEventListener('close', () => {
-        console.log('[MarketData] WebSocket closed, scheduling reconnect');
-        this.scheduleReconnect();
-      });
-
-      await this.subscribeToTickers();
-
-      console.log('[MarketData] Connected');
-    } catch (err) {
-      console.error('[MarketData] WebSocket connection failed:', err);
-    }
+    await this.pollAllMids();
+    this.pollingInterval = setInterval(() => this.pollAllMids(), 3000);
+    this.pollingInterval.unref();
+    console.log(`[MarketData] Started polling for symbols: ${this.config.symbols.join(', ')}`);
   }
 
-  private async subscribeToTickers(): Promise<void> {
-    if (!this.ws) return;
-
-    this.subscriptions = [];
-
+  private async pollAllMids(): Promise<void> {
     for (const symbol of this.config.symbols) {
-      const sub = await this.ws.subscribe(
-        'ticker.s',
-        buildTickerFeed(symbol, '500'),
-        (data: any) => {
-          this.handleTickerData(data);
-        }
-      );
-      this.subscriptions.push(sub);
-    }
-
-    console.log(`[MarketData] Subscribed to tickers: ${this.config.symbols.join(', ')}`);
-  }
-
-  private scheduleReconnect(): void {
-    if (this.reconnectAttempts >= this.maxReconnectAttempts) {
-      console.error('[MarketData] Max reconnect attempts reached');
-      return;
-    }
-    const delay = Math.min(1000 * Math.pow(2, this.reconnectAttempts), 30000);
-    this.reconnectAttempts++;
-    this.reconnectTimer = setTimeout(async () => {
       try {
-        await this.connect();
-        this.reconnectAttempts = 0;
+        const marketData = await this.fetchLighterPrice(symbol);
+        if (!marketData) continue;
+
+        this.latestPrices.set(symbol, marketData);
+        this.writeToRedis(marketData);
+        for (const cb of this.priceCallbacks) {
+          cb(marketData);
+        }
       } catch (err) {
-        this.scheduleReconnect();
+        console.error(`[MarketData] Poll failed for ${symbol}:`, err);
       }
-    }, delay);
+    }
   }
 
-  handleTickerData(rawData: any): void {
-    const data = this.parseTickerData(rawData);
-    this.latestPrices.set(data.symbol, data);
-    this.writeToRedis(data);
-    for (const cb of this.priceCallbacks) {
-      cb(data);
+  private async fetchLighterPrice(symbol: string): Promise<MarketData | null> {
+    if (!this.dexAdapter || !this.dexAdapter.getMidPrice) return null;
+    try {
+      const priceData = await this.dexAdapter.getMidPrice(symbol);
+      if (priceData && priceData.midPrice > 0) {
+        return {
+          symbol,
+          lastPrice: priceData.midPrice,
+          bidPrice: priceData.bestBid,
+          askPrice: priceData.bestAsk,
+          volume24h: 0,
+          timestamp: Date.now(),
+        };
+      }
+    } catch (err) {
+      console.warn(`[MarketData] Lighter price fetch failed for ${symbol}:`, (err as Error).message);
     }
+    return null;
   }
 
   onPriceUpdate(callback: (data: MarketData) => void): void {
     this.priceCallbacks.push(callback);
   }
 
-  parseTickerData(raw: any): MarketData {
-    return {
-      symbol: raw.instrument || 'UNKNOWN',
-      lastPrice: parseFloat(raw.last_price || '0'),
-      bidPrice: parseFloat(raw.best_bid_price || '0'),
-      askPrice: parseFloat(raw.best_ask_price || '0'),
-      volume24h: parseFloat(raw.volume_24h || raw.volume || '0'),
-      timestamp: raw.event_time ? Math.floor(parseInt(raw.event_time, 10) / 1_000_000) : Date.now(),
-    };
-  }
-
   private async writeToRedis(data: MarketData): Promise<void> {
     try {
       await this.redis.xadd(
         `market:${data.symbol}`,
-        'MAXLEN',
-        '~',
-        '10000',
-        '*',
+        'MAXLEN', '~', '10000', '*',
         'symbol', data.symbol,
         'lastPrice', String(data.lastPrice),
         'bidPrice', String(data.bidPrice),
@@ -141,17 +102,9 @@ export class MarketDataStream {
   }
 
   async disconnect(): Promise<void> {
-    if (this.reconnectTimer) {
-      clearTimeout(this.reconnectTimer);
-      this.reconnectTimer = null;
-    }
-    for (const sub of this.subscriptions) {
-      await sub.unsubscribe().catch(() => {});
-    }
-    this.subscriptions = [];
-    if (this.ws) {
-      await this.ws.close().catch(() => {});
-      this.ws = null;
+    if (this.pollingInterval) {
+      clearInterval(this.pollingInterval);
+      this.pollingInterval = null;
     }
     this.redis.disconnect();
   }

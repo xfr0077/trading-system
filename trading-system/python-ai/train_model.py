@@ -4,6 +4,9 @@ import torch.nn as nn
 import pickle, os, sys
 from collections import Counter
 
+# Add src to path for imports
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
+
 N_SAMPLES = 5000
 WINDOW = 100
 LOOK_AHEAD = 15
@@ -32,11 +35,14 @@ def weighted_sampling(X, y, n_samples):
     return X[sampled], y[sampled]
 
 class TradingLSTM(nn.Module):
-    def __init__(self, input_dim=9, hidden_dim=64, num_layers=2, dropout=0.2):
+    def __init__(self, input_dim=12, hidden_dim=128, num_layers=2, dropout=0.3):
         super().__init__()
         self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers, batch_first=True, dropout=dropout)
         self.head = nn.Sequential(
-            nn.Linear(hidden_dim, 32),
+            nn.Linear(hidden_dim, 64),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(64, 32),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(32, 3),
@@ -53,7 +59,7 @@ class TradingLSTM(nn.Module):
 def load_real_data():
     if not os.path.exists(DATA_PATH):
         print(f'No training data at {DATA_PATH}, generating synthetic...')
-        return None
+        return None, None
     with open(DATA_PATH, 'rb') as f:
         data = pickle.load(f)
     return data['X'], data['y']
@@ -100,11 +106,11 @@ def train():
         np.random.seed(42)
         torch.manual_seed(42)
         base_price = 50000.0
-        prices = base_price * np.exp(np.cumsum(np.random.randn(6000) * 0.004))
+        prices = base_price * np.exp(np.cumsum(np.random.randn(10000) * 0.003))
         from feature_engine import FeatureEngine
-        engine = FeatureEngine(window_size=WINDOW)
+        engine = FeatureEngine(window_size=WINDOW, use_legacy_features=False)
         class MD:
-            def __init__(self, p, v): self.lastPrice=p; self.bidPrice=p*0.999; self.askPrice=p*1.001; self.volume24h=v; self.timestamp=0
+            def __init__(self, p, v): self.lastPrice=p; self.bidPrice=p*0.9999; self.askPrice=p*1.0001; self.volume24h=v; self.timestamp=0
         X_list, y_list = [], []
         for i in range(len(prices) - WINDOW - LOOK_AHEAD - 1):
             window = [MD(prices[j], 100+50*np.random.rand()) for j in range(i, i+WINDOW)]
@@ -116,14 +122,12 @@ def train():
         X, y = np.array(X_list, dtype=np.float32), np.array(y_list, dtype=np.int64)
         X, y = weighted_sampling(X, y, len(y))
 
-    # Normalize
-    mean = X.mean(axis=0, keepdims=True)
-    std = X.std(axis=0, keepdims=True)
-    std[std < 1e-9] = 1
-    X_norm = (X - mean) / std
+    # P0 Fix: Features are already stationary, no Z-Score normalization needed
+    # Just ensure no NaN/Inf values
+    X = np.nan_to_num(X, nan=0.0, posinf=1.0, neginf=-1.0)
 
     split = int(len(X) * 0.8)
-    X_train, X_test = X_norm[:split], X_norm[split:]
+    X_train, X_test = X[:split], X[split:]
     y_train, y_test = y[:split], y[split:]
 
     # Reshape for LSTM: (batch, window=1, features) since features already encode window info
@@ -176,7 +180,7 @@ def train():
     os.makedirs(os.path.dirname(MODEL_PATH), exist_ok=True)
     export_to_onnx(model, device, X_train_lstm.shape[1], X_train_lstm.shape[2])
     print(f'Model saved to {MODEL_PATH}')
-    verify_onnx(X_test_lstm, y_test, mean, std)
+    verify_onnx(X_test_lstm, y_test)
 
 def export_to_onnx(model, device, batch_size, input_dim):
     model.cpu()
@@ -202,7 +206,7 @@ def export_to_onnx(model, device, batch_size, input_dim):
         dynamo=False,
     )
 
-def verify_onnx(X_test, y_test, mean, std):
+def verify_onnx(X_test, y_test):
     import onnxruntime as ort
     session = ort.InferenceSession(MODEL_PATH, providers=['CPUExecutionProvider'])
     input_name = session.get_inputs()[0].name

@@ -128,7 +128,7 @@ class TestSendSignalValidation:
 
     def test_negative_stop_loss_raises_error(self, mock_stub):
         client = SignalClient(stub=mock_stub)
-        with pytest.raises(ValueError, match="stop_loss must be positive"):
+        with pytest.raises(ValueError, match="stop_loss must be non-negative"):
             client.send_signal(
                 symbol="BTC_USDT_Perp",
                 action="long",

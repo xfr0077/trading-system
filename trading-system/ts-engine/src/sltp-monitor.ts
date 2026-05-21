@@ -9,8 +9,12 @@ export interface SLTPOrder {
   stopLoss?: number;
   takeProfit?: number;
   entryPrice: number;
-  status: 'active' | 'triggered' | 'cancelled';
+  status: 'active' | 'triggered' | 'cancelled' | 'pending_close';
   createdAt: number;
+  pendingCloseOrderId?: string;
+  trailingStopPct?: number;
+  highestPrice?: number;
+  lowestPrice?: number;
 }
 
 export interface PriceLevel {
@@ -51,9 +55,22 @@ export class SLTPMonitor {
     for (const order of this.activeOrders.values()) {
       if (order.symbol !== symbol || order.status !== 'active') continue;
 
-      const triggerPrice = order.side === 'long'
-        ? { sl: order.stopLoss, tp: order.takeProfit }
-        : { sl: order.stopLoss, tp: order.takeProfit };
+      // H6: Update trailing stop levels
+      if (order.trailingStopPct && order.trailingStopPct > 0) {
+        if (order.side === 'long') {
+          order.highestPrice = Math.max(order.highestPrice || order.entryPrice, lastPrice);
+          const newStop = order.highestPrice * (1 - order.trailingStopPct);
+          if (order.stopLoss && newStop > order.stopLoss) {
+            order.stopLoss = newStop;
+          }
+        } else {
+          order.lowestPrice = Math.min(order.lowestPrice || order.entryPrice, lastPrice);
+          const newStop = order.lowestPrice * (1 + order.trailingStopPct);
+          if (order.stopLoss && newStop < order.stopLoss) {
+            order.stopLoss = newStop;
+          }
+        }
+      }
 
       let hit: 'stop_loss' | 'take_profit' | null = null;
 
@@ -74,9 +91,8 @@ export class SLTPMonitor {
       }
     }
 
-    for (const t of triggered) {
-      this.activeOrders.delete(t.clientOrderId);
-    }
+    // H2: Don't delete triggered orders immediately - let caller manage lifecycle
+    // Orders are removed when close order confirms or after timeout
 
     return triggered;
   }

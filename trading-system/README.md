@@ -1,82 +1,49 @@
 # AI 自动化加密货币交易系统
 
-> 基于混合架构的 AI 驱动加密货币交易系统，VPS 端执行交易，本地端运行 AI 推理，通过 Tailscale 安全通信。
+> Lighter DEX 永续合约自动化交易系统，AI 信号驱动，模拟盘运行中。
 
 ## 架构概览
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                        本地 PC (AI 推理)                         │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────────┐   │
-│  │  特征工程     │→│  ONNX 模型    │→│  gRPC Client         │   │
-│  │ feature_eng  │  │ inference    │  │  (SignalClient)      │   │
-│  └──────────────┘  └──────────────┘  └──────────┬───────────┘   │
-└─────────────────────────────────────────────────┼───────────────┘
-                                                  │ Tailscale
-                                                  │ (加密隧道)
-                                                  ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                   VPS 香港 (交易执行)                            │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────────┐   │
-│  │  gRPC Server │→│  风控引擎     │→│  GRVT DEX 订单执行    │   │
-│  │ SignalRouter │  │ risk_engine  │  │  (AWS Tokyo)         │   │
-│  └──────────────┘  └──────────────┘  └──────────────────────┘   │
-│        │                                                        │
-│        ▼                                                        │
-│  ┌──────────────┐  ┌──────────────┐                             │
-│  │  Redis       │  │  SQLite WAL  │                             │
-│  │  (行情缓存)   │  │  (订单/持仓)  │                             │
-│  └──────────────┘  └──────────────┘                             │
-└─────────────────────────────────────────────────────────────────┘
+本地 PC (AI 推理)                          VPS 香港 (交易执行)
+┌──────────────────────┐                  ┌──────────────────────────────┐
+│ Redis → 特征工程     │                  │ gRPC Server → 风控引擎       │
+│ → ONNX LSTM 推理     │ ──── gRPC ────→  │ → Lighter Adapter → Python  │
+│ → SignalClient       │   (Tailscale)   │    Bridge → Lighter DEX 主网 │
+└──────────────────────┘                  │ → SQLite + PositionTracker  │
+                                          │ → Dashboard (端口 80)       │
+                                          └──────────────────────────────┘
 ```
 
-### 为什么选择混合架构？
+## 当前状态
 
-| 考量 | 方案 | 理由 |
-|------|------|------|
-| **执行延迟** | VPS 香港 | GRVT 交易所位于 AWS Tokyo，香港 VPS 延迟 ~150ms，满足 1m/5m 时间帧交易需求 |
-| **推理算力** | 本地 PC | 避免云端 GPU 成本，利用本地 CPU 运行 ONNX 模型（~10-30ms 推理延迟可接受） |
-| **网络安全** | Tailscale | 绕过 GFW 和公共网络不稳定，提供端到端加密的虚拟局域网 |
-| **数据安全** | 本地推理 | 模型和交易策略保留在本地，不暴露给云端 |
+| 项目 | 说明 |
+|------|------|
+| **模式** | 模拟盘 (PAPER_TRADING=true) |
+| **DEX** | Lighter (mainnet) |
+| **账户余额** | ~$215 (真实) / $10,000 (模拟) |
+| **Dashboard** | http://43.247.132.103/ |
+| **部署方式** | Docker Compose on VPS |
 
 ## 快速开始
 
 ### 前置要求
 
-- **VPS 端**: Docker & Docker Compose v2+, Node.js 20+
-- **本地端**: Python 3.10+, Tailscale 客户端
-- **网络**: 两端均安装并登录 Tailscale，确保可互相访问
+- **VPS 端**: Docker & Docker Compose v2+
+- **本地端**: Python 3.10+, `pip install lighter-sdk`
 
-### 1. 克隆项目
-
-```bash
-git clone <your-repo-url>
-cd trading-system
-```
-
-### 2. 配置环境变量
+### 部署
 
 ```bash
-# 复制并编辑环境变量
-cp .env.example .env
+# 上传代码到 VPS 后
+cd /opt/trading-system
+docker compose build --no-cache
+docker compose up -d
 
-# 编辑 .env 文件，填入真实值
-# GRVT_API_KEY: 从 https://app.grvt.io 获取
-# GRVT_ENV: testnet（测试）或 mainnet（生产）
-# TAILSCALE_AI_IP: 本地 AI 设备的 Tailscale IP（通过 `tailscale status` 查看）
-```
-
-### 3. 启动 VPS 端服务
-
-```bash
-# 构建并启动 Docker 容器
-docker compose up -d --build
-
-# 查看服务状态
+# 查看状态
 docker compose ps
-
-# 查看日志
 docker compose logs -f ts-engine
+```
 ```
 
 ### 4. 配置本地 Python AI
@@ -129,7 +96,7 @@ trading-system/
 │   │   ├── risk-engine.ts          # 风控引擎（TTL/置信度/仓位/滑点/保证金/Shadow Position）
 │   │   ├── margin-monitor.ts       # 保证金监控（阈值预警、状态回调）
 │   │   ├── order-manager.ts        # 订单管理器（状态机、部分成交）
-│   │   └── market-data.ts          # GRVT 行情 WebSocket + Redis 写入
+│   │   └── market-data.ts          # Hyperliquid REST 轮询 + Redis 写入
 │   ├── tests/                      # 单元测试
 │   ├── proto/                      # 生成的 gRPC TypeScript 代码
 │   ├── package.json
@@ -185,13 +152,13 @@ Proto 定义位于 `proto/signal.proto`，包含两个 RPC 方法：
 
 ### TS Engine
 
-- **配置验证**: 启动时校验必需环境变量（`GRVT_API_KEY`、`GRVT_ENV`、`GRPC_PORT`）
+- **配置验证**: 启动时校验必需环境变量（`PRIVATE_KEY`、`GRPC_PORT`）
 - **信号去重**: 5 分钟 TTL 窗口，自动清理过期信号 ID
 - **输入验证**: 校验 action 合法性、confidence 范围、position_size 正数等
 - **gRPC 错误处理**: 区分 `INVALID_ARGUMENT`、`UNAVAILABLE`、`DEADLINE_EXCEEDED` 等状态码
 - **风控引擎**: TTL 校验、置信度、单笔仓位、滑点保护、保证金联动、Shadow Position
 - **订单管理**: 状态机（pending → submitted → partially_filled → filled/cancelled/rejected）
-- **行情数据**: GRVT WebSocket → Redis Streams → 内存价格缓存（0ms 滑点校验）
+- **行情数据**: Hyperliquid REST API (allMids) → Redis Streams → 内存价格缓存（3s 轮询）
 - **保证金监控**: 自动阈值计算（warning/critical）、状态变更回调
 
 ### Python AI Client
@@ -286,14 +253,15 @@ pytest tests/integration/test_e2e.py -v
 
 | 变量 | 必需 | 默认值 | 说明 |
 |------|------|--------|------|
-| `GRVT_API_KEY` | ✅ | - | GRVT 交易所 API 密钥 |
-| `GRVT_ENV` | - | `testnet` | 运行环境：`testnet` 或 `mainnet` |
+| `PRIVATE_KEY` | ✅ | - | EVM 钱包私钥（Hyperliquid 签名） |
+| `DEX` | - | `hyperliquid` | 交易所：`hyperliquid` 或 `grvt` |
+| `DEX_ENV` | - | `testnet` | 运行环境：`testnet` 或 `production` |
 | `GRPC_PORT` | - | `50051` | gRPC 服务监听端口 |
 | `REDIS_URL` | - | `redis://localhost:6379` | Redis 连接字符串 |
 | `SQLITE_PATH` | - | `/data/trades.db` | SQLite 数据库路径 |
 | `TAILSCALE_AI_IP` | ✅ | - | 本地 AI 的 Tailscale IP |
-| `GRVT_MARKET_DATA_WS_URL` | - | `wss://market-data.dev.gravitymarkets.io/ws` | GRVT 行情 WebSocket |
-| `GRVT_TRADING_WS_URL` | - | `wss://trades.dev.gravitymarkets.io/ws` | GRVT 交易 WebSocket |
+| `GRPC_PORT` | - | `50051` | gRPC 监听端口 |
+| `DASHBOARD_PORT` | - | `3000` | Dashboard HTTP 端口 |
 | `MAX_POSITION_SIZE` | - | `0.1` | 单笔最大仓位 |
 | `MAX_DAILY_LOSS` | - | `500` | 每日最大亏损（USDT） |
 | `MAX_CONCURRENT_SIGNALS` | - | `3` | 同一标的最大并发持仓 |
@@ -327,11 +295,11 @@ pytest tests/integration/test_e2e.py -v
 
 ### Phase 2 ✅ 已完成
 
-- [x] TS Engine 配置扩展（GRVT 端点、风控参数）
+- [x] TS Engine 配置扩展（DEX 切换、风控参数）
 - [x] Risk Engine（风控引擎 + Shadow Position）
 - [x] Margin Monitor（保证金监控 + 阈值预警）
 - [x] Order Manager（订单状态机 + 部分成交）
-- [x] Market Data（GRVT WebSocket + Redis + 内存缓存）
+- [x] Market Data（Hyperliquid REST + Redis + 内存缓存）
 - [x] SignalRouter 集成风控和滑点校验
 - [x] Python AI 配置管理（Pydantic）
 - [x] Python AI Redis 行情消费者（跳尾机制）
@@ -341,10 +309,10 @@ pytest tests/integration/test_e2e.py -v
 
 ### Phase 3 ✅ 已完成
 
-- [x] GRVT TradingWS 实际下单（限价 + 市价，REST API，EIP-712 签名）
+- [x] Hyperliquid SDK 实际下单（限价 + 市价，WebSocket 签名）
 - [x] 订单超时取消（OrderTimeoutManager，支持重启恢复）
 - [x] SQLite 持久化（订单 + 持仓 + 交易历史，WAL 模式）
-- [x] GRVT WebSocket 实际连接（@wezzcoetzee/grvt SDK，自动重连）
+- [x] Hyperliquid SDK 实际连接（hyperliquid 1.7.7，WebSocket + REST）
 - [x] 信号优先级队列预留接口（ISignalQueue）
 - [x] 重启恢复：从 SQLite 恢复未完成订单的取消定时器
 - [x] 竞态防护：终态订单拒收后置状态变更

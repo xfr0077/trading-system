@@ -4,13 +4,12 @@ import * as path from 'path';
 import * as fs from 'fs';
 import { RiskEngine, RiskCheckInput } from './risk-engine';
 import { MarginMonitor } from './margin-monitor';
-import { MarketDataStream } from './market-data';
+import { MarketDataStream, MarketData } from './market-data';
 import { OrderManager } from './order-manager';
 import { Config } from './config';
 import { SqliteStore, Order } from './sqlite-store';
 import { OrderTimeoutManager } from './order-timeout-manager';
-import { TradingWebSocket, GrvtConfig } from './trading-ws';
-import { GrvtEnv } from '@wezzcoetzee/grvt';
+import { IDexAdapter, createDexAdapter, DexConfig, OrderInput as DexOrderInput, OrderUpdate as DexOrderUpdate, Position as DexPosition, OpenOrder as DexOpenOrder } from './dex';
 import { OrderUpdate } from './types';
 import { ISignalQueue, DefaultSignalQueue } from './signal-queue';
 import { PositionTracker, PositionData } from './position-tracker';
@@ -67,11 +66,17 @@ export class SignalRouter {
   private orderManager: OrderManager;
   private sqliteStore: SqliteStore;
   private timeoutManager: OrderTimeoutManager;
-  private tradingWs: TradingWebSocket;
+  private dexAdapter: IDexAdapter;
   private signalQueue: ISignalQueue;
   private positionTracker: PositionTracker;
   private sltpMonitor: SLTPMonitor;
   private config: Config;
+  private redis: any = null;
+  // P2: Signal rate limiting
+  private signalTimestamps = new Map<string, number[]>(); // symbol -> [timestamps]
+  private readonly MAX_SIGNALS_PER_MINUTE = 5;
+  public signalHistory: Array<{ signalId: string; symbol: string; action: string; confidence: number; positionSize: number; signalPrice: number; accepted: boolean; reason: string; timestamp: number }> = [];
+  private readonly MAX_SIGNAL_HISTORY = 200;
 
   constructor(config: Config) {
     this.config = config;
@@ -86,6 +91,15 @@ export class SignalRouter {
       maxPriceDeviationPct: config.maxPriceDeviationPct,
       signalTtlMs: config.signalTtlMs,
       requireMarginOk: true,
+      maxPortfolioExposure: config.maxPositionSize * 3,
+      maxCorrelatedExposure: config.maxPositionSize * 2,
+      maxLeverage: 10,
+      kellyFraction: 0.25,
+      atrMultiplier: 2,
+      minRiskRewardRatio: 2,
+      maxDrawdownPct: 0.15,
+      trailingStopPct: 0.03,
+      scaleInLevels: 3,
     });
     this.marginMonitor = new MarginMonitor({
       warningThreshold: config.marginWarningThreshold,
@@ -94,27 +108,44 @@ export class SignalRouter {
     this.orderManager = new OrderManager();
     this.sqliteStore = new SqliteStore(config.sqlitePath);
     this.timeoutManager = new OrderTimeoutManager();
-    this.tradingWs = new TradingWebSocket();
+    // Paper trading mode: use simulated adapter instead of real DEX
+    if (config.paperTrading) {
+      const { PaperTradingAdapter } = require('./dex/paper-trading');
+      this.dexAdapter = new PaperTradingAdapter();
+      console.log('[SignalRouter] PAPER TRADING MODE enabled');
+    } else {
+      this.dexAdapter = createDexAdapter(config.dexProvider);
+    }
     this.signalQueue = new DefaultSignalQueue();
     this.positionTracker = new PositionTracker();
     this.sltpMonitor = new SLTPMonitor();
 
-    this.tradingWs.onOrderUpdate((update) => this.handleOrderUpdate(update));
+    this.dexAdapter.onOrderUpdate((update: DexOrderUpdate) => {
+      const internalUpdate: OrderUpdate = {
+        clientOrderId: update.order.clientOrderId,
+        orderId: update.order.exchangeOrderId,
+        status: this.mapDexOrderStatus(update.order.status),
+        fee: update.fill ? String(update.fill.fee) : '0',
+      };
+      this.handleOrderUpdate(internalUpdate);
+    });
   }
 
   async initialize(): Promise<void> {
+    await this.sqliteStore.waitReady();
+
     // 重启恢复：从数据库恢复未完成订单的定时器
     const openOrders = this.sqliteStore.getOpenOrders();
     await this.timeoutManager.restoreFromDatabase(openOrders, async (orderId, remainingMs) => {
       this.timeoutManager.schedule(orderId, remainingMs, async () => {
         const order = this.sqliteStore.getOrder(orderId);
         if (order && order.status === 'submitted') {
-          await this.tradingWs.cancelOrder(order.orderId);
+          await this.dexAdapter.cancelOrder(order.orderId);
           this.orderManager.updateStatus(orderId, 'cancelled');
           order.status = 'cancelled';
           order.updatedAt = Date.now();
           this.sqliteStore.saveOrder(order);
-          this.riskEngine.updateShadowPosition(order.symbol, 0);
+          this.riskEngine.updateShadowPosition(order.symbol, -parseFloat(order.size));
         }
       });
     });
@@ -127,15 +158,15 @@ export class SignalRouter {
       if (order.expiresAt && order.expiresAt < now && order.status === 'submitted') {
         // 取消交易所订单
         if (order.orderId) {
-          await this.tradingWs.cancelOrder(order.orderId).catch(() => {});
+          await this.dexAdapter.cancelOrder(order.orderId).catch(() => {});
         }
         // 更新本地状态
         order.status = 'cancelled';
         order.updatedAt = now;
         this.sqliteStore.saveOrder(order);
-        this.riskEngine.updateShadowPosition(order.symbol, 0);
+        this.riskEngine.updateShadowPosition(order.symbol, -parseFloat(order.size));
         // 从 positionTracker 中移除
-        this.positionTracker['openOrders'].delete(order.clientOrderId);
+        this.positionTracker.removeOpenOrder(order.clientOrderId);
         expiredCount++;
       }
     }
@@ -146,7 +177,7 @@ export class SignalRouter {
     // 同步数据库中未过期的挂单到 positionTracker
     const validOrders = openOrders.filter(o => !o.expiresAt || o.expiresAt >= now || o.status !== 'submitted');
     for (const order of validOrders) {
-      this.positionTracker['openOrders'].set(order.clientOrderId, {
+      this.positionTracker.addOpenOrder(order.clientOrderId, {
         orderId: order.orderId || order.clientOrderId,
         symbol: order.symbol,
         side: order.side,
@@ -182,36 +213,76 @@ export class SignalRouter {
       console.log(`[SignalRouter] Restored ${filledOrders.length} SLTP monitors from database`);
     }
 
-    // 连接 TradingWS
-    await this.tradingWs.connect({
-      apiKey: this.config.grvtApiKey,
-      privateKey: this.config.grvtPrivateKey,
-      tradingAccountId: this.config.grvtTradingAccountId,
-      env: this.config.grvtEnv,
-    });
+    // 连接 DEX Adapter
+    const dexConfig: DexConfig = {
+      dexName: this.config.dexProvider,
+      testnet: this.config.env === 'testnet',
+      privateKey: this.config.privateKey,
+      walletAddress: this.config.walletAddress,
+      rpcUrl: this.config.lighterBaseUrl,
+      apiKeyIndex: this.config.lighterApiKeyIndex,
+      apiPublicKey: this.config.lighterApiPublicKey,
+      apiPrivateKey: this.config.lighterApiPrivateKey,
+      accountIndex: this.config.lighterAccountIndex,
+    };
+    await this.dexAdapter.connect(dexConfig);
+
+    // C2: Start MarginMonitor polling from DEX adapter
+    this.startMarginPolling();
 
     // 启动持仓轮询
     this.positionTracker.startPolling(
-      () => this.tradingWs.getPositions(),
-      () => this.tradingWs.getOpenOrders(),
+      async () => (await this.dexAdapter.getPositions()).map(p => this.mapDexPosition(p)),
+      async () => (await this.dexAdapter.getOpenOrders()).map(o => this.mapDexOpenOrder(o)),
     );
 
     // 首次同步持仓，确保信号到达前有数据
     try {
-      const positions = await this.tradingWs.getPositions();
-      const orders = await this.tradingWs.getOpenOrders();
-      if (positions.length > 0 || orders.length > 0) {
+      const dexPositions = await this.dexAdapter.getPositions();
+      const dexOrders = await this.dexAdapter.getOpenOrders();
+      const positions = dexPositions.map(p => this.mapDexPosition(p));
+      const orders = dexOrders.map(o => this.mapDexOpenOrder(o));
+      if (dexPositions.length > 0 || dexOrders.length > 0) {
         this.positionTracker.sync(positions, orders);
       }
     } catch (err) {
       console.warn('[SignalRouter] Initial position fetch failed, will rely on polling:', err);
     }
 
-    // 加载 instruments
+    // 加载 instruments（通过 getCapabilities 获取 DEX 能力）
     await this.loadInstruments();
 
     // 启动订单状态轮询（REST API 无推送，需主动查询）
     this.startOrderStatusPolling();
+  }
+
+  private startMarginPolling(): void {
+    const pollMargin = async () => {
+      try {
+        const getAccountFn = this.dexAdapter.getAccount;
+        if (!getAccountFn) return;
+        const account = await getAccountFn.call(this.dexAdapter);
+        const totalBalance = account.totalBalance || 0;
+        const availableBalance = account.availableBalance || 0;
+        const usedMargin = totalBalance - availableBalance;
+        const marginRatio = totalBalance > 0 ? usedMargin / totalBalance : 0;
+
+        this.marginMonitor.updateStatus({
+          totalEquity: totalBalance,
+          availableMargin: availableBalance,
+          usedMargin,
+          marginRatio,
+          updatedAt: Date.now(),
+        });
+      } catch (err) {
+        console.warn('[SignalRouter] Margin polling error:', err);
+      }
+    };
+
+    // Initial poll
+    pollMargin();
+    // Poll every 10 seconds
+    setInterval(pollMargin, 10000).unref();
   }
 
   private startOrderStatusPolling(): void {
@@ -220,16 +291,16 @@ export class SignalRouter {
         const submittedOrders = this.sqliteStore.getOpenOrders().filter(o => o.status === 'submitted');
         if (submittedOrders.length === 0) return;
 
-        const exchangeOrders = await this.tradingWs.getOpenOrders();
+        const exchangeOrders = await this.dexAdapter.getOpenOrders();
         const exchangeOrderMap = new Map<string, any>();
         for (const o of exchangeOrders) {
-          exchangeOrderMap.set(o.client_order_id || o.order_id, o);
+          exchangeOrderMap.set(o.clientOrderId || o.exchangeOrderId, o);
         }
 
-        const positions = await this.tradingWs.getPositions();
+        const dexPositions = await this.dexAdapter.getPositions();
         const positionMap = new Map<string, any>();
-        for (const p of positions) {
-          positionMap.set(p.symbol, p);
+        for (const p of dexPositions) {
+          positionMap.set(p.market, p);
         }
 
         for (const localOrder of submittedOrders) {
@@ -239,7 +310,7 @@ export class SignalRouter {
             if (newStatus !== localOrder.status) {
               this.handleOrderUpdate({
                 clientOrderId: localOrder.clientOrderId,
-                orderId: exchangeOrder.order_id || localOrder.orderId,
+                orderId: exchangeOrder.exchangeOrderId || localOrder.orderId,
                 status: newStatus,
                 fee: String(exchangeOrder.fee || '0'),
               });
@@ -247,7 +318,7 @@ export class SignalRouter {
           } else {
             // 交易所查不到，检查是否有对应持仓来判断是否成交
             const position = positionMap.get(localOrder.symbol);
-            if (position && parseFloat(position.size) > 0) {
+            if (position && position.size > 0) {
               console.log(`[SignalRouter] Order ${localOrder.clientOrderId} likely filled (position exists for ${localOrder.symbol})`);
               this.handleOrderUpdate({
                 clientOrderId: localOrder.clientOrderId,
@@ -274,6 +345,44 @@ export class SignalRouter {
     this.orderStatusPollInterval.unref();
   }
 
+  private mapDexOrderStatus(status: string): 'pending' | 'submitted' | 'filled' | 'cancelled' | 'rejected' | 'partially_filled' {
+    const map: Record<string, 'pending' | 'submitted' | 'filled' | 'cancelled' | 'rejected' | 'partially_filled'> = {
+      'pending': 'pending',
+      'open': 'submitted',
+      'new': 'submitted',
+      'partially_filled': 'partially_filled',
+      'filled': 'filled',
+      'cancelled': 'cancelled',
+      'rejected': 'rejected',
+      'expired': 'cancelled',
+    };
+    return map[status] || 'submitted';
+  }
+
+  private mapDexPosition(dexPos: DexPosition): { symbol: string; side: 'long' | 'short'; size: string; entryPrice: string; unrealizedPnl: string; realizedPnl: string; updatedAt: number } {
+    return {
+      symbol: dexPos.market,
+      side: dexPos.side === 'none' ? 'long' : dexPos.side,
+      size: String(dexPos.size),
+      entryPrice: String(dexPos.entryPrice),
+      unrealizedPnl: String(dexPos.unrealizedPnl),
+      realizedPnl: String(dexPos.realizedPnl),
+      updatedAt: Date.now(),
+    };
+  }
+
+  private mapDexOpenOrder(dexOrder: DexOpenOrder): { orderId: string; symbol: string; side: 'buy' | 'sell'; size: number; price: number; stopLoss?: number; takeProfit?: number; status: string; createdAt: number } {
+    return {
+      orderId: dexOrder.exchangeOrderId,
+      symbol: dexOrder.market,
+      side: dexOrder.side,
+      size: dexOrder.size,
+      price: dexOrder.price,
+      status: dexOrder.status,
+      createdAt: dexOrder.createdAt,
+    };
+  }
+
   private mapExchangeStatus(status: string): 'pending' | 'submitted' | 'filled' | 'cancelled' | 'rejected' | 'partially_filled' {
     const map: Record<string, 'pending' | 'submitted' | 'filled' | 'cancelled' | 'rejected' | 'partially_filled'> = {
       'open': 'submitted',
@@ -288,38 +397,93 @@ export class SignalRouter {
   }
 
   private async loadInstruments(): Promise<void> {
-    if (!this.tradingWs || !this.config) return;
+    if (!this.dexAdapter || !this.config) return;
     try {
-      const instruments = await this.tradingWs.getInstruments();
-      for (const inst of instruments) {
-        this.tradingWs.addInstrument(inst.symbol, inst.instrument_hash, inst.base_decimals || 9);
-      }
-      console.log(`[SignalRouter] Loaded ${instruments.length} instruments`);
+      const caps = this.dexAdapter.getCapabilities();
+      console.log(`[SignalRouter] DEX capabilities loaded: ${this.config.dexProvider} (maxLeverage: ${caps.maxLeverage})`);
     } catch (err) {
-      console.error('[SignalRouter] Failed to load instruments:', err);
+      console.error('[SignalRouter] Failed to load DEX capabilities:', err);
     }
   }
 
   async initializeMarketData(redis: any): Promise<void> {
+    this.redis = redis;
     const { MarketDataStream } = await import('./market-data');
     this.marketData = new MarketDataStream({
-      apiKey: this.config.grvtApiKey,
-      env: this.config.grvtEnvCommunity,
       symbols: this.config.symbols,
-    }, redis);
+    }, redis, this.dexAdapter);
     await this.marketData.connect();
 
     this.marketData.onPriceUpdate((data) => {
-      const triggered = this.sltpMonitor.checkPrice(data.symbol, data.lastPrice, data.bidPrice, data.askPrice);
+      // Paper trading: update simulated position prices
+      if (this.config.paperTrading && 'updatePrices' in this.dexAdapter) {
+        (this.dexAdapter as any).updatePrices(data.symbol, data.lastPrice);
+      }
+
+      // M1: Update price history for real ATR calculation
+      this.riskEngine.updatePriceHistory(data.symbol, data.lastPrice);
+
+      // P1: Use bid/ask for SLTP triggers instead of lastPrice
+      // Long SL triggers on bid (can sell at bid), Long TP triggers on ask (can sell at ask)
+      // Short SL triggers on ask (can buy at ask), Short TP triggers on bid (can buy at bid)
+      const sltpPrice = data.lastPrice; // Fallback, but check bid/ask for precision
+      const triggered = this.sltpMonitor.checkPrice(data.symbol, sltpPrice, data.bidPrice, data.askPrice);
       for (const t of triggered) {
         const closeSide = t.side === 'long' ? 'sell' : 'buy';
         const triggeredType = t.stopLoss ? 'stop_loss' : 'take_profit';
-        console.log(`[SLTP] ${triggeredType.toUpperCase()} triggered for ${t.symbol} @ ${data.lastPrice}`);
-        this.submitCloseOrder(t.symbol, closeSide, t.size, data.lastPrice, t).catch(err => {
+        // P1: Use appropriate price for close order
+        const closePrice = t.stopLoss
+          ? (t.side === 'long' ? data.bidPrice : data.askPrice) // SL: use worse price (conservative)
+          : (t.side === 'long' ? data.askPrice : data.bidPrice); // TP: use better price (optimistic)
+        console.log(`[SLTP] ${triggeredType.toUpperCase()} triggered for ${t.symbol} @ ${closePrice}`);
+        this.submitCloseOrder(t.symbol, closeSide, t.size, closePrice, t).catch(err => {
           console.error(`[SLTP] Failed to submit close order: ${err.message}`);
         });
       }
     });
+  }
+
+  private async getRedisLatestPrice(symbol: string): Promise<MarketData | null> {
+    if (!this.redis) return null;
+    try {
+      const result = await this.redis.xrevrange(`market:${symbol}`, '+', '-', 'COUNT', 1);
+      if (result && result.length > 0) {
+        const entry = result[0];
+        const fields = entry[1];
+        const lastPrice = parseFloat(fields[fields.indexOf('lastPrice') + 1]);
+        const bidPrice = parseFloat(fields[fields.indexOf('bidPrice') + 1]);
+        const askPrice = parseFloat(fields[fields.indexOf('askPrice') + 1]);
+        const timestamp = parseInt(fields[fields.indexOf('timestamp') + 1], 10) || Date.now();
+        if (lastPrice > 0) return { symbol, lastPrice, bidPrice, askPrice, volume24h: 0, timestamp };
+      }
+    } catch (err) {
+      console.error('[SignalRouter] Redis price fallback failed:', err);
+    }
+    return null;
+  }
+
+  getPositionTracker(): PositionTracker {
+    return this.positionTracker;
+  }
+
+  getSLTPMonitor(): SLTPMonitor {
+    return this.sltpMonitor;
+  }
+
+  getRiskEngine(): RiskEngine {
+    return this.riskEngine;
+  }
+
+  getMarketData(): MarketDataStream | null {
+    return this.marketData;
+  }
+
+  getSqliteStore(): SqliteStore {
+    return this.sqliteStore;
+  }
+
+  getSignalHistory(): Array<{ signalId: string; symbol: string; action: string; confidence: number; positionSize: number; signalPrice: number; accepted: boolean; reason: string; timestamp: number }> {
+    return this.signalHistory;
   }
 
   setMarketData(stream: MarketDataStream): void {
@@ -336,32 +500,38 @@ export class SignalRouter {
 
   private async submitCloseOrder(symbol: string, side: 'buy' | 'sell', size: number, price: number, sltpOrder: SLTPOrder): Promise<string | null> {
     try {
-      const orderForSubmit: Order = {
+      // H1: Verify position still exists before submitting close
+      const positions = await this.dexAdapter.getPositions();
+      const pos = positions.find(p => p.market === symbol);
+      if (!pos || pos.size <= 0) {
+        console.log(`[SLTP] No position for ${symbol}, skipping close order`);
+        return null;
+      }
+
+      const orderInput: DexOrderInput = {
         clientOrderId: `sltp-${sltpOrder.clientOrderId}-${Date.now()}`,
-        orderId: '',
-        signalId: '',
-        symbol,
+        market: symbol,
         side,
-        size: String(size),
-        remainingSize: String(size),
-        limitPrice: String(price),
-        stopLoss: '0',
-        takeProfit: '0',
-        status: 'pending',
-        orderType: 'market',
-        fee: '0',
-        createdAt: Date.now(),
-        updatedAt: Date.now(),
-        expiresAt: Date.now() + 30000,
+        type: 'market',
+        size: Math.min(size, pos.size), // H1: Don't close more than actual position
+        price,
+        reduceOnly: true,
       };
 
-      const exchangeOrderId = await this.tradingWs.submitOrder(orderForSubmit);
+      const exchangeOrderId = await this.dexAdapter.submitOrder(orderInput);
       if (exchangeOrderId) {
-        console.log(`[SLTP] Close order submitted: ${orderForSubmit.clientOrderId} -> ${exchangeOrderId}`);
+        console.log(`[SLTP] Close order submitted: ${orderInput.clientOrderId} -> ${exchangeOrderId}`);
+        // H2: Keep SLTP in "pending_close" state until close order confirms
+        sltpOrder.status = 'triggered';
+        sltpOrder.pendingCloseOrderId = exchangeOrderId;
       }
       return exchangeOrderId;
     } catch (err) {
       console.error(`[SLTP] Close order failed: ${(err as Error).message}`);
+      // H2: Re-add to active monitoring if close submission fails
+      sltpOrder.status = 'active';
+      sltpOrder.pendingCloseOrderId = undefined;
+      this.sltpMonitor.addOrder(sltpOrder);
       return null;
     }
   }
@@ -385,17 +555,17 @@ export class SignalRouter {
     if (!signal.action || !VALID_ACTIONS.has(signal.action)) {
       return `action must be one of: ${Array.from(VALID_ACTIONS).join(', ')}`;
     }
-    if (signal.confidence < 0 || signal.confidence > 100) {
-      return 'confidence must be between 0 and 100';
-    }
     if (signal.positionSize <= 0) {
       return 'positionSize must be greater than 0';
     }
-    if (signal.stopLoss <= 0) {
-      return 'stopLoss must be greater than 0';
-    }
-    if (signal.takeProfit <= 0) {
-      return 'takeProfit must be greater than 0';
+    // For close action, stopLoss and takeProfit can be 0
+    if (signal.action !== 'close') {
+      if (signal.stopLoss <= 0) {
+        return 'stopLoss must be greater than 0';
+      }
+      if (signal.takeProfit <= 0) {
+        return 'takeProfit must be greater than 0';
+      }
     }
     if (signal.signalPrice <= 0) {
       return 'signalPrice must be greater than 0';
@@ -406,18 +576,71 @@ export class SignalRouter {
     return null;
   }
 
+  private recordSignal(signal: SignalInput, result: { accepted: boolean; reason: string }): void {
+    this.signalHistory.unshift({
+      signalId: signal.signalId,
+      symbol: signal.symbol,
+      action: signal.action,
+      confidence: signal.confidence,
+      positionSize: signal.positionSize,
+      signalPrice: signal.signalPrice,
+      accepted: result.accepted,
+      reason: result.reason,
+      timestamp: Date.now(),
+    });
+    if (this.signalHistory.length > this.MAX_SIGNAL_HISTORY) {
+      this.signalHistory.length = this.MAX_SIGNAL_HISTORY;
+    }
+  }
+
   async handleSignal(signal: SignalInput): Promise<{ accepted: boolean; reason: string }> {
     const validationError = this.validateSignal(signal);
     if (validationError) {
       throw new Error(`INVALID_ARGUMENT: ${validationError}`);
     }
 
-    if (!this.marketData) {
-      return { accepted: false, reason: 'MARKET_DATA_NOT_INITIALIZED' };
+    const reject = (reason: string): { accepted: false; reason: string } => {
+      this.recordSignal(signal, { accepted: false, reason });
+      return { accepted: false, reason };
+    };
+
+    // Cross-field validations
+    if (signal.confidence < 0 || signal.confidence > 100) return reject('INVALID_CONFIDENCE');
+    if (!this.config.symbols.includes(signal.symbol)) return reject('INVALID_SYMBOL');
+
+    // P2: Signal rate limiting - max N signals per minute per symbol
+    const rateLimitNow = Date.now();
+    const symbolTimestamps = this.signalTimestamps.get(signal.symbol) || [];
+    const oneMinuteAgo = rateLimitNow - 60 * 1000;
+    const recentSignals = symbolTimestamps.filter(t => t > oneMinuteAgo);
+    if (recentSignals.length >= this.MAX_SIGNALS_PER_MINUTE) {
+      return reject('SIGNAL_RATE_LIMITED');
     }
-    const currentPriceData = this.marketData.getLatestPriceInMemory(signal.symbol);
+    recentSignals.push(rateLimitNow);
+    this.signalTimestamps.set(signal.symbol, recentSignals);
+
+    // Direction-based stop-loss/take-profit validation
+    if (signal.action === 'long') {
+      if (signal.stopLoss >= signal.signalPrice || signal.signalPrice >= signal.takeProfit) {
+        return reject('INVALID_SL_TP');
+      }
+    } else if (signal.action === 'short') {
+      if (signal.takeProfit >= signal.signalPrice || signal.signalPrice >= signal.stopLoss) {
+        return reject('INVALID_SL_TP');
+      }
+    }
+    // For action 'close': no SL/TP validation needed
+
+    if (!this.marketData) {
+      return reject('MARKET_DATA_NOT_INITIALIZED');
+    }
+    let currentPriceData = this.marketData.getLatestPriceInMemory(signal.symbol);
     if (!currentPriceData) {
-      return { accepted: false, reason: 'PRICE_DATA_UNAVAILABLE' };
+      console.log('[SignalRouter] No live price data, falling back to Redis');
+      currentPriceData = await this.getRedisLatestPrice(signal.symbol);
+      if (!currentPriceData) {
+        return reject('PRICE_DATA_UNAVAILABLE');
+      }
     }
 
     const marginStatus = this.marginMonitor.getStatus();
@@ -447,16 +670,24 @@ export class SignalRouter {
       return { accepted: false, reason: riskResult.reason };
     }
 
+    // 去重检查（需要在挂单检查之前，避免重复信号被误判为 PENDING_ORDER_EXISTS）
+    const now = Date.now();
+    const lastSeen = this.seenSignals.get(signal.signalId);
+    if (lastSeen && now - lastSeen < this.TTL_MS) {
+      return reject('DUPLICATE_SIGNAL');
+    }
+    this.seenSignals.set(signal.signalId, now);
+
     // Position check: close without position, or duplicate direction
     const pos = realPositions.get(signal.symbol);
 
     if (signal.action === 'close') {
       if (!pos || pos.size <= 0) {
-        return { accepted: false, reason: 'NO_POSITION_TO_CLOSE' };
+        return reject('NO_POSITION_TO_CLOSE');
       }
     } else if (signal.action === 'long' || signal.action === 'short') {
       if (pos && pos.size > 0 && pos.side === signal.action) {
-        return { accepted: false, reason: 'POSITION_ALREADY_OPEN' };
+        return reject('POSITION_ALREADY_OPEN');
       }
     }
 
@@ -464,34 +695,53 @@ export class SignalRouter {
     const pendingOrders = this.positionTracker.getOpenOrders();
     for (const [_, order] of pendingOrders) {
       if (order.symbol === signal.symbol) {
-        return { accepted: false, reason: 'PENDING_ORDER_EXISTS' };
+        return reject('PENDING_ORDER_EXISTS');
       }
     }
 
     // 通过队列（默认直接通过）
     const processedSignal = await this.signalQueue.enqueue(signal);
 
-    // 去重检查
-    const now = Date.now();
-    const lastSeen = this.seenSignals.get(processedSignal.signalId);
-    if (lastSeen && now - lastSeen < this.TTL_MS) {
-      return { accepted: false, reason: 'DUPLICATE_SIGNAL' };
-    }
+    // P0 Fix: Use totalBalance for portfolio value, not availableBalance
+    const dexPositions = await this.dexAdapter.getPositions();
+    const accountInfo = await this.dexAdapter.getAccount?.();
+    const totalValue = accountInfo?.totalBalance || accountInfo?.availableBalance || 200;
 
-    this.seenSignals.set(processedSignal.signalId, now);
+    const dynamicSize = this.riskEngine.calculateDynamicPositionSize(
+      processedSignal,
+      currentPriceData.lastPrice,
+      totalValue,
+    );
+
+    // P1: Use AI's SL/TP if confidence is high (>= 80%), otherwise use calculated SLTP
+    let stopLoss: number;
+    let takeProfit: number;
+    if (processedSignal.confidence >= 80) {
+      // Trust AI's risk assessment for high-confidence signals
+      stopLoss = processedSignal.stopLoss;
+      takeProfit = processedSignal.takeProfit;
+    } else {
+      // Use risk engine's ATR-based calculation for lower confidence
+      const calculated = this.riskEngine.calculateSLTP(
+        processedSignal,
+        currentPriceData.lastPrice,
+      );
+      stopLoss = calculated.stopLoss;
+      takeProfit = calculated.takeProfit;
+    }
 
     // 创建订单
     const order = this.orderManager.createOrder({
       signalId: processedSignal.signalId,
       symbol: processedSignal.symbol,
       side: processedSignal.action === 'long' ? 'buy' : 'sell',
-      size: processedSignal.positionSize,
-      limitPrice: processedSignal.signalPrice,
-      stopLoss: processedSignal.stopLoss,
-      takeProfit: processedSignal.takeProfit,
+      size: dynamicSize,
+      limitPrice: currentPriceData.lastPrice,
+      stopLoss,
+      takeProfit,
     });
 
-    // 提交到 GRVT
+    // 提交到 DEX（使用市价单）
     const ttlMs = this.config.signalTtlMs;
     const expiresAt = Date.now() + ttlMs;
     const orderForSubmit: Order = {
@@ -506,46 +756,69 @@ export class SignalRouter {
       stopLoss: String(order.stopLoss || 0),
       takeProfit: String(order.takeProfit || 0),
       status: 'pending',
-      orderType: 'limit',
+      orderType: 'market',
       fee: '0',
       createdAt: Date.now(),
       updatedAt: Date.now(),
       expiresAt,
     };
 
-    const exchangeOrderId = await this.tradingWs.submitOrder(orderForSubmit).catch(err => {
-      console.error(`[SignalRouter] Order submission to GRVT failed (non-fatal):`, (err as Error).message);
+    const dexOrderInput: DexOrderInput = {
+      clientOrderId: order.clientOrderId,
+      market: order.symbol,
+      side: order.side,
+      type: 'market',
+      size: order.size,
+      price: currentPriceData.lastPrice,
+    };
+
+    const exchangeOrderId = await this.dexAdapter.submitOrder(dexOrderInput).catch(err => {
+      console.error(`[SignalRouter] Order submission failed:`, (err as Error).message);
       return null;
     });
 
     if (!exchangeOrderId) {
-      console.warn(`[SignalRouter] Signal ${order.clientOrderId} accepted but order not submitted to GRVT`);
-      return { accepted: true, reason: 'ORDER_SUBMISSION_FAILED' };
+      console.error(`[SignalRouter] Signal ${order.clientOrderId} rejected: order submission failed`);
+      return reject('ORDER_SUBMISSION_FAILED');
     }
 
     this.orderManager.updateStatus(order.clientOrderId, 'submitted', exchangeOrderId);
+
+    // C5: Update shadow position AFTER successful submission, using dynamicSize
+    this.riskEngine.updateShadowPosition(signal.symbol, dynamicSize);
 
     // 设置超时定时器
     this.timeoutManager.schedule(order.clientOrderId, ttlMs, async () => {
       const currentOrder = this.orderManager.getOrder(order.clientOrderId);
       if (currentOrder && !['filled', 'cancelled', 'rejected'].includes(currentOrder.status)) {
-        await this.tradingWs.cancelOrder(exchangeOrderId);
+        await this.dexAdapter.cancelOrder(exchangeOrderId);
         this.orderManager.updateStatus(order.clientOrderId, 'cancelled');
-        this.riskEngine.updateShadowPosition(order.symbol, 0);
+        this.riskEngine.updateShadowPosition(order.symbol, -order.size);
       }
     });
 
     // 持久化
     this.sqliteStore.saveOrder({
-      ...orderForSubmit,
+      clientOrderId: order.clientOrderId,
       orderId: exchangeOrderId,
+      signalId: order.signalId,
+      symbol: order.symbol,
+      side: order.side,
+      size: String(order.size),
+      remainingSize: String(order.size),
+      limitPrice: String(order.limitPrice),
+      stopLoss: String(order.stopLoss || 0),
+      takeProfit: String(order.takeProfit || 0),
       status: 'submitted',
+      orderType: 'market',
+      fee: '0',
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      expiresAt,
     });
 
-    this.riskEngine.updateShadowPosition(signal.symbol, signal.positionSize);
-
     // 同步到 positionTracker
-    this.positionTracker['openOrders'].set(order.clientOrderId, {
+    this.positionTracker.addOpenOrder(order.clientOrderId, {
       orderId: exchangeOrderId,
       symbol: order.symbol,
       side: order.side,
@@ -559,6 +832,7 @@ export class SignalRouter {
 
     console.log(`[SignalRouter] Order submitted: ${order.clientOrderId} -> ${exchangeOrderId}`);
 
+    this.recordSignal(signal, { accepted: true, reason: '' });
     return { accepted: true, reason: '' };
   }
 
@@ -577,9 +851,9 @@ export class SignalRouter {
 
     // 更新 Shadow Position 和持久化
     if (update.status === 'filled') {
-      this.riskEngine.updateShadowPosition(order.symbol, 0);
+      this.riskEngine.updateShadowPosition(order.symbol, -order.size);
       this.positionTracker.onOrderFilled(order.symbol, order.side, order.size, parseFloat(String(order.limitPrice)));
-      this.positionTracker['openOrders'].delete(order.clientOrderId);
+      this.positionTracker.removeOpenOrder(order.clientOrderId);
       this.sqliteStore.updatePosition(order.symbol, order.side === 'buy' ? 'long' : 'short', String(order.size), String(order.limitPrice));
       this.timeoutManager.cancel(order.clientOrderId);
 
@@ -595,12 +869,15 @@ export class SignalRouter {
           entryPrice: parseFloat(String(order.limitPrice)),
           status: 'active',
           createdAt: order.createdAt,
+          trailingStopPct: this.config.trailingStopPct || 0,
+          highestPrice: parseFloat(String(order.limitPrice)),
+          lowestPrice: parseFloat(String(order.limitPrice)),
         });
       }
     } else if (update.status === 'cancelled' || update.status === 'rejected') {
-      this.riskEngine.updateShadowPosition(order.symbol, 0);
+      this.riskEngine.updateShadowPosition(order.symbol, -order.size);
       this.timeoutManager.cancel(order.clientOrderId);
-      this.positionTracker['openOrders'].delete(order.clientOrderId);
+      this.positionTracker.removeOpenOrder(order.clientOrderId);
     }
 
     // 更新并保存订单
@@ -619,7 +896,7 @@ export class SignalRouter {
       stopLoss: String(order.stopLoss || 0),
       takeProfit: String(order.takeProfit || 0),
       status: order.status,
-      orderType: 'limit',
+      orderType: order.orderType || 'market',
       fee: update.fee,
       createdAt: order.createdAt,
       updatedAt: Date.now(),
@@ -627,7 +904,7 @@ export class SignalRouter {
     });
   }
 
-  async startServer(port: number): Promise<grpc.Server> {
+  async startServer(port: number, tlsEnabled = false): Promise<grpc.Server> {
     const server = new grpc.Server();
     server.addService(protoDescriptor.signal.SignalService.service, {
       SendSignal: async (call: grpc.ServerUnaryCall<TradingSignal, any>, callback: grpc.sendUnaryData<any>) => {
@@ -661,7 +938,22 @@ export class SignalRouter {
     });
 
     return new Promise<grpc.Server>((resolve, reject) => {
-      server.bindAsync(`0.0.0.0:${port}`, grpc.ServerCredentials.createInsecure(), (err, boundPort) => {
+      let credentials: grpc.ServerCredentials;
+      if (tlsEnabled) {
+        const tlsKeyPath = process.env.GRPC_TLS_KEY_PATH || '/app/certs/server.key';
+        const tlsCertPath = process.env.GRPC_TLS_CERT_PATH || '/app/certs/server.crt';
+        try {
+          const key = fs.readFileSync(tlsKeyPath);
+          const cert = fs.readFileSync(tlsCertPath);
+          credentials = grpc.ServerCredentials.createSsl(null, [{ private_key: key, cert_chain: cert }]);
+        } catch (err) {
+          console.warn(`[SignalRouter] TLS certs not found, falling back to insecure: ${(err as Error).message}`);
+          credentials = grpc.ServerCredentials.createInsecure();
+        }
+      } else {
+        credentials = grpc.ServerCredentials.createInsecure();
+      }
+      server.bindAsync(`0.0.0.0:${port}`, credentials, (err, boundPort) => {
         if (err) {
           console.error(`[SignalRouter] Failed to bind server on port ${port}: ${err.message}`);
           reject(err);
@@ -683,7 +975,7 @@ export class SignalRouter {
       this.orderStatusPollInterval = null;
     }
     this.timeoutManager.clearAll();
-    this.tradingWs.disconnect();
+    this.dexAdapter.disconnect();
     this.sqliteStore.close();
   }
 }

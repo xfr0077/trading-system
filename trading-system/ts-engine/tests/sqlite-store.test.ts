@@ -6,9 +6,10 @@ describe('SqliteStore', () => {
   let store: SqliteStore;
   const dbPath = path.join(__dirname, 'test-trading.db');
 
-  beforeEach(() => {
+  beforeEach(async () => {
     if (fs.existsSync(dbPath)) fs.unlinkSync(dbPath);
     store = new SqliteStore(dbPath);
+    await store.waitReady();
   });
 
   afterEach(() => {
@@ -105,5 +106,44 @@ describe('SqliteStore', () => {
     const history = store.getTradeHistory('BTC_USDT_Perp', 10);
     expect(history.length).toBe(1);
     expect(history[0].symbol).toBe('BTC_USDT_Perp');
+  });
+
+  test('should flush pending writes to disk', async () => {
+    store.saveOrder({
+      clientOrderId: 'flush-1', orderId: 'e-flush', signalId: 's-flush',
+      symbol: 'BTC_USDT_Perp', side: 'buy', size: '0.01', remainingSize: '0.01',
+      limitPrice: '98500', status: 'submitted', orderType: 'limit', fee: '0',
+      createdAt: Date.now(), updatedAt: Date.now(), expiresAt: Date.now() + 300000,
+    });
+
+    // Flush pending debounced writes
+    await store.flush();
+
+    // Verify data was persisted to disk by loading a fresh store
+    const store2 = new SqliteStore(dbPath);
+    await store2.waitReady();
+    const order = store2.getOrder('flush-1');
+    expect(order).not.toBeNull();
+    expect(order?.clientOrderId).toBe('flush-1');
+    store2.close();
+  });
+
+  test('close() should persist data synchronously', async () => {
+    store.saveOrder({
+      clientOrderId: 'close-1', orderId: 'e-close', signalId: 's-close',
+      symbol: 'ETH_USDT_Perp', side: 'sell', size: '0.1', remainingSize: '0.1',
+      limitPrice: '3400', status: 'submitted', orderType: 'limit', fee: '0',
+      createdAt: Date.now(), updatedAt: Date.now(), expiresAt: Date.now() + 300000,
+    });
+
+    // close() does a final sync persist without waiting for debounce timer
+    store.close();
+
+    const store2 = new SqliteStore(dbPath);
+    await store2.waitReady();
+    const order = store2.getOrder('close-1');
+    expect(order).not.toBeNull();
+    expect(order?.clientOrderId).toBe('close-1');
+    store2.close();
   });
 });

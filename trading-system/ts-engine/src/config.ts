@@ -1,15 +1,12 @@
-import { EGrvtEnvironment } from '@grvt/sdk';
-import { GrvtEnv } from '@wezzcoetzee/grvt';
-
 export interface Config {
-  grvtApiKey: string;
-  grvtPrivateKey: string;
-  grvtTradingAccountId: string;
-  grvtEnv: EGrvtEnvironment;
-  grvtEnvCommunity: GrvtEnv;
+  privateKey: string;
+  env: string;
+  dexProvider: 'lighter' | 'ostium';
   redisUrl: string;
   sqlitePath: string;
   grpcPort: number;
+  grpcTlsEnabled: boolean;
+  dashboardPort: number;
   tailscaleAiIp: string;
   symbols: string[];
   maxPositionSize: number;
@@ -20,6 +17,18 @@ export interface Config {
   signalTtlMs: number;
   marginWarningThreshold: number;
   marginCriticalThreshold: number;
+  trailingStopPct: number;
+  paperTrading: boolean;
+  dashboardToken?: string;
+  corsOrigins: string[];
+  rateLimitRpm: number;
+  // Lighter-specific
+  lighterApiKeyIndex?: number;
+  lighterApiPublicKey?: string;
+  lighterApiPrivateKey?: string;
+  lighterBaseUrl?: string;
+  walletAddress?: string;
+  lighterAccountIndex?: number;
 }
 
 function validatePositiveNumber(value: number, name: string): number {
@@ -43,18 +52,8 @@ function validateNonNegativeNumber(value: number, name: string): number {
 }
 
 export function loadConfig(): Config {
-  const grvtApiKey = process.env.GRVT_API_KEY;
-  if (!grvtApiKey) throw new Error('GRVT_API_KEY is required');
-
-  const grvtPrivateKey = process.env.GRVT_PRIVATE_KEY;
-  if (!grvtPrivateKey) throw new Error('GRVT_PRIVATE_KEY is required');
-
-  const grvtTradingAccountId = process.env.GRVT_TRADING_ACCOUNT_ID;
-  if (!grvtTradingAccountId) throw new Error('GRVT_TRADING_ACCOUNT_ID is required');
-
-  const grvtEnvRaw = process.env.GRVT_ENV || 'testnet';
-  const grvtEnv = mapGrvtEnvironment(grvtEnvRaw);
-  const grvtEnvCommunity = mapGrvtEnvironmentCommunity(grvtEnvRaw);
+  const privateKey = process.env.GRVT_PRIVATE_KEY || process.env.PRIVATE_KEY;
+  if (!privateKey) throw new Error('GRVT_PRIVATE_KEY or PRIVATE_KEY is required');
 
   const symbols = (process.env.SYMBOLS || 'BTC_USDT_Perp,ETH_USDT_Perp').split(',').map(s => s.trim());
 
@@ -97,15 +96,28 @@ export function loadConfig(): Config {
     throw new Error('MARGIN_WARNING_THRESHOLD must be less than MARGIN_CRITICAL_THRESHOLD');
   }
 
+  const corsOriginsRaw = process.env.CORS_ORIGINS || '';
+  const corsOrigins = corsOriginsRaw
+    ? corsOriginsRaw.split(',').map(s => s.trim()).filter(Boolean)
+    : ['http://localhost:3000'];
+
+  const rateLimitRpm = parseInt(process.env.RATE_LIMIT_RPM || '60', 10);
+  if (isNaN(rateLimitRpm) || rateLimitRpm < 1) {
+    throw new Error('RATE_LIMIT_RPM must be a positive integer');
+  }
+
+  const dashboardToken = process.env.DASHBOARD_TOKEN || undefined;
+  const grpcTlsEnabled = process.env.GRPC_TLS_ENABLED === 'true';
+
   return {
-    grvtApiKey,
-    grvtPrivateKey,
-    grvtTradingAccountId,
-    grvtEnv,
-    grvtEnvCommunity,
+    privateKey,
+    env: process.env.GRVT_ENV || process.env.DEX_ENV || 'testnet',
+    dexProvider: (process.env.DEX_PROVIDER || process.env.DEX || 'lighter') as 'lighter' | 'ostium',
     redisUrl: process.env.REDIS_URL || 'redis://localhost:6379',
     sqlitePath: process.env.SQLITE_PATH || '/data/trades.db',
     grpcPort: port,
+    grpcTlsEnabled,
+    dashboardPort: parseInt(process.env.DASHBOARD_PORT || '3000', 10),
     tailscaleAiIp: process.env.TAILSCALE_AI_IP || '127.0.0.1',
     symbols,
     maxPositionSize,
@@ -116,27 +128,17 @@ export function loadConfig(): Config {
     signalTtlMs: parseInt(process.env.SIGNAL_TTL_MS || '300000', 10),
     marginWarningThreshold,
     marginCriticalThreshold,
+    trailingStopPct: parseFloat(process.env.TRAILING_STOP_PCT || '0.03'),
+    paperTrading: process.env.PAPER_TRADING === 'true',
+    dashboardToken,
+    corsOrigins,
+    rateLimitRpm,
+    // Lighter-specific
+    lighterApiKeyIndex: process.env.LIGHTER_API_KEY_INDEX ? parseInt(process.env.LIGHTER_API_KEY_INDEX, 10) : undefined,
+    lighterApiPublicKey: process.env.LIGHTER_API_PUBLIC_KEY || undefined,
+    lighterApiPrivateKey: process.env.LIGHTER_API_PRIVATE_KEY || undefined,
+    lighterBaseUrl: process.env.LIGHTER_BASE_URL || undefined,
+    lighterAccountIndex: process.env.LIGHTER_ACCOUNT_INDEX ? parseInt(process.env.LIGHTER_ACCOUNT_INDEX, 10) : undefined,
+    walletAddress: process.env.WALLET_ADDRESS || undefined,
   };
-}
-
-function mapGrvtEnvironment(env: string): EGrvtEnvironment {
-  const map: Record<string, EGrvtEnvironment> = {
-    'testnet': EGrvtEnvironment.TESTNET,
-    'prod': EGrvtEnvironment.PRODUCTION,
-    'production': EGrvtEnvironment.PRODUCTION,
-    'staging': EGrvtEnvironment.STAGING,
-    'dev': EGrvtEnvironment.DEV,
-  };
-  return map[env.toLowerCase()] || EGrvtEnvironment.TESTNET;
-}
-
-function mapGrvtEnvironmentCommunity(env: string): GrvtEnv {
-  const map: Record<string, GrvtEnv> = {
-    'testnet': GrvtEnv.TESTNET,
-    'prod': GrvtEnv.PROD,
-    'production': GrvtEnv.PROD,
-    'staging': GrvtEnv.STG,
-    'dev': GrvtEnv.DEV,
-  };
-  return map[env.toLowerCase()] || GrvtEnv.TESTNET;
 }

@@ -1,83 +1,89 @@
 # TS Engine — TypeScript 交易引擎
 
-VPS 端交易执行引擎，负责接收 AI 信号、风控验证、执行 GRVT 订单。
+VPS 端交易执行引擎，接收 AI 信号 → 风控验证 → 执行 Lighter 订单。
 
-## 快速开始
+## 架构
 
-### 安装依赖
-
-```bash
-npm install
+```
+gRPC (Python AI) → SignalRouter → RiskEngine → DexAdapter → lighter_bridge.py → Lighter DEX
+                    ↕               ↕            ↕
+                 Dashboard      SQLite       PositionTracker
+                 (端口 80)      (trades.db)
 ```
 
-### 开发模式
+## 环境变量 (当前值)
 
-```bash
-npm run dev
-```
+| 变量 | 当前值 | 说明 |
+|------|--------|------|
+| `DEX_PROVIDER` | `lighter` | DEX 适配器 |
+| `PAPER_TRADING` | `true` | 模拟盘模式 |
+| `GRPC_PORT` | `50051` | gRPC 端口 |
+| `DASHBOARD_PORT` | `80` | Dashboard 端口 |
+| `MAX_POSITION_SIZE` | `0.003` | 最大仓位 (BTC) |
+| `MAX_DAILY_LOSS` | `20` | 日亏限额 $ |
+| `MAX_CONCURRENT_SIGNALS` | `2` | 最大并发信号 |
+| `MIN_CONFIDENCE` | `60` | 最小置信度 % |
+| `SIGNAL_TTL_MS` | `300000` | 信号有效期 5min |
+| `CORS_ORIGINS` | `http://localhost:3000` | CORS 来源 |
+| `RATE_LIMIT_RPM` | `60` | 限速 |
 
-### 构建
+## 关键模块
 
-```bash
-npm run build
-```
+| 模块 | 路径 | 职责 |
+|------|------|------|
+| `SignalRouter` | `src/signal-router.ts` | gRPC 服务 + 信号路由 |
+| `RiskEngine` | `src/risk-engine.ts` | 11 项风控检查 + 动态仓位 |
+| `LighterAdapter` | `src/dex/lighter.ts` | Lighter DEX 适配器 (Python 桥接) |
+| `Dashboard` | `src/dashboard.ts` | HTTP Dashboard |
+| `lighter_bridge.py` | `lighter_bridge.py` | Python SDK 桥接进程 |
 
-### 运行
+## Dashboard API
 
-```bash
-npm start
-```
-
-### 测试
-
-```bash
-npm test
-```
-
-### 生成 gRPC 代码
-
-```bash
-npm run proto:generate
-```
-
-## 环境变量
-
-| 变量 | 必需 | 默认值 | 说明 |
-|------|------|--------|------|
-| `GRVT_API_KEY` | ✅ | - | GRVT 交易所 API 密钥 |
-| `GRVT_ENV` | - | `testnet` | 运行环境：`testnet` 或 `mainnet` |
-| `GRPC_PORT` | - | `50051` | gRPC 服务监听端口 |
-| `REDIS_URL` | - | `redis://localhost:6379` | Redis 连接字符串 |
-| `SQLITE_PATH` | - | `/data/trades.db` | SQLite 数据库路径 |
-| `TAILSCALE_AI_IP` | ✅ | - | 本地 AI 的 Tailscale IP |
-| `GRVT_MARKET_DATA_WS_URL` | - | `wss://market-data.dev.gravitymarkets.io/ws` | GRVT 行情 WebSocket 端点 |
-| `GRVT_TRADING_WS_URL` | - | `wss://trades.dev.gravitymarkets.io/ws` | GRVT 交易 WebSocket 端点 |
-| `GRVT_REST_API_URL` | - | `https://api.dev.gravitymarkets.io` | GRVT REST API 端点 |
-| `MAX_POSITION_SIZE` | - | `0.1` | 单笔最大仓位（BTC 等） |
-| `MAX_DAILY_LOSS` | - | `500` | 每日最大亏损（USDT） |
-| `MAX_CONCURRENT_SIGNALS` | - | `3` | 同一标的最大并发持仓 |
-| `MIN_CONFIDENCE` | - | `60.0` | 最低置信度阈值 |
-| `MAX_PRICE_DEVIATION_PCT` | - | `0.5` | 最大价格偏差百分比 |
-| `SIGNAL_TTL_MS` | - | `30000` | 信号有效期（毫秒） |
-| `MARGIN_WARNING_THRESHOLD` | - | `0.7` | 保证金率预警阈值 |
-| `MARGIN_CRITICAL_THRESHOLD` | - | `0.9` | 保证金率强平阈值 |
+| 路径 | 说明 |
+|------|------|
+| `/` | 中文 Dashboard 页面 |
+| `/api/status` | 系统状态 (uptime/版本/模式) |
+| `/api/positions` | 当前持仓 |
+| `/api/orders` | 挂单列表 |
+| `/api/risk` | 风控详情 |
+| `/api/history` | 最近 100 条订单 |
+| `/api/signals` | AI 信号历史 |
+| `/api/paper-stats` | 模拟盘统计 |
+| `/api/sltp` | 止盈止损监控 |
+| `/api/events` | SSE 实时推送 |
 
 ## 模块说明
 
-### `config.ts` — 配置管理
+### `signal-router.ts` — 核心路由
+- gRPC 服务端，接收 Python AI 发来的交易信号
+- 信号验证 → 风控检查 → 动态仓位 → SL/TP 决策 → 订单执行
+- 信号历史记录（供 Dashboard 展示）
 
-- 从环境变量加载配置
-- 启动时校验必需字段
-- 类型安全的配置接口
-- Phase 2 扩展：GRVT WebSocket 端点、风控参数
+### `risk-engine.ts` — 风控引擎
+11 项检查：信号过期 / 置信度 / 日亏 / 价格偏差 / 保证金 / 并发 / 敞口 / 相关性 / 回撤 / 风报比
+动态仓位 = min(Kelly公式, 波动率调整值, MAX_POSITION_SIZE)
 
-```typescript
-import { loadConfig } from './config';
+### `dex/lighter.ts` — Lighter DEX 适配器
+通过 Python 子进程桥接 (`lighter_bridge.py`)，JSON 行协议通信
+支持：市价/限价/止损/止盈订单，自动重连，断路器
 
-const config = loadConfig();
-console.log(config.grpcPort); // 50051
-console.log(config.maxPositionSize); // 0.1
-```
+### `dashboard.ts` — HTTP 仪表盘
+- 中文 UI，实时 SSE 推送
+- REST API：信号/持仓/挂单/交易记录/风控
+
+### `order-manager.ts` — 订单管理
+状态机 `pending → submitted → filled/cancelled/rejected`
+内存缓存 + SQLite，最大 1000 条
+
+### `position-tracker.ts` — 持仓跟踪
+内存映射 + DEX 轮询同步（2 秒间隔）
+
+### `sqlite-store.ts` — 持久化
+sql.js 内存写入 + 1 秒 debounce 刷盘
+终态订单即时同步，7 天过期清理
+
+### `sltp-monitor.ts` — 止盈止损
+价格水平监控 + 追踪止损，bid/ask 精确触发
 
 ### `signal-router.ts` — gRPC 信号路由器
 

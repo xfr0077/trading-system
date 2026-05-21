@@ -1,14 +1,11 @@
 import { loadConfig } from '../src/config';
-import { EGrvtEnvironment } from '@grvt/sdk';
 
 describe('Config Phase 2 - Validation & Defaults', () => {
   const originalEnv = { ...process.env };
 
   beforeEach(() => {
     process.env = { ...originalEnv };
-    process.env.GRVT_API_KEY = 'test-key';
     process.env.GRVT_PRIVATE_KEY = '0xtest-secret';
-    process.env.GRVT_TRADING_ACCOUNT_ID = 'test-account';
   });
 
   afterEach(() => {
@@ -104,20 +101,6 @@ describe('Config Phase 2 - Validation & Defaults', () => {
       const config = loadConfig();
       expect(config.marginWarningThreshold).toBe(0.6);
       expect(config.marginCriticalThreshold).toBe(0.85);
-    });
-  });
-
-  describe('environment validation', () => {
-    test('should default to testnet for invalid env', () => {
-      process.env.GRVT_ENV = 'invalid';
-      const config = loadConfig();
-      expect(config.grvtEnv).toBe(EGrvtEnvironment.TESTNET);
-    });
-
-    test('should accept testnet', () => {
-      process.env.GRVT_ENV = 'testnet';
-      const config = loadConfig();
-      expect(config.grvtEnv).toBe(EGrvtEnvironment.TESTNET);
     });
   });
 });
