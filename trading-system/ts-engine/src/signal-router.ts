@@ -959,7 +959,25 @@ export class SignalRouter {
       this.riskEngine.updateShadowPosition(order.symbol, -order.size);
       this.positionTracker.onOrderFilled(order.symbol, order.side, order.size, parseFloat(String(order.limitPrice)));
       this.positionTracker.removeOpenOrder(order.clientOrderId);
-      this.sqliteStore.updatePosition(order.symbol, order.side === 'buy' ? 'long' : 'short', String(order.size), String(order.limitPrice));
+      // Correctly update position in SQLite: reduce existing if opposite direction
+      const existingPos = this.sqliteStore.getPosition(order.symbol);
+      const newSide = order.side === 'buy' ? 'long' : 'short';
+      const newSize = order.size;
+      if (existingPos && parseFloat(existingPos.size) > 0 && existingPos.side !== newSide) {
+        // Opposite direction: reduce or close
+        const existingSize = parseFloat(existingPos.size);
+        const netSize = existingSize - newSize;
+        if (netSize <= 0) {
+          // Position fully closed
+          this.sqliteStore.updatePosition(order.symbol, existingPos.side, '0', existingPos.entryPrice);
+        } else {
+          // Partially reduced
+          this.sqliteStore.updatePosition(order.symbol, existingPos.side, String(netSize), existingPos.entryPrice);
+        }
+      } else {
+        // Same direction or new position: add or create
+        this.sqliteStore.updatePosition(order.symbol, newSide, String(newSize), String(order.limitPrice));
+      }
       this.timeoutManager.cancel(order.clientOrderId);
 
       // Record trade history for every fill
