@@ -225,7 +225,9 @@ export class RiskEngine {
     const currentShadow = this.shadowPositions.get(signal.symbol) || 0;
     const realPosition = input.currentPositions.find(p => p.symbol === signal.symbol);
     const realSize = realPosition ? realPosition.size : 0;
-    const totalExposure = currentShadow + realSize + signal.positionSize;
+    // Close actions reduce exposure, don't add signal.positionSize
+    const newSize = signal.action === 'close' ? 0 : signal.positionSize;
+    const totalExposure = currentShadow + realSize + newSize;
 
     if (totalExposure > this.config.maxPositionSize * this.config.maxConcurrentSignals) {
       return { allowed: false, reason: 'CONCURRENT_SIGNALS_EXCEEDED' };
@@ -247,27 +249,27 @@ export class RiskEngine {
       return { allowed: false, reason: 'MAX_DRAWDOWN_EXCEEDED' };
     }
 
-    const riskReward = this.validateRiskReward(signal, currentPrice);
-    if (!riskReward.valid) {
-      return { allowed: false, reason: 'RISK_REWARD_TOO_LOW' };
+    // Skip risk-reward check for close actions (exits, not entries)
+    if (signal.action !== 'close') {
+      const riskReward = this.validateRiskReward(signal, currentPrice);
+      if (!riskReward.valid) {
+        return { allowed: false, reason: 'RISK_REWARD_TOO_LOW' };
+      }
     }
 
     return { allowed: true, reason: '' };
   }
 
-  private calculateCorrelatedExposure(newSymbol: string, newSize: number): number {
-    // Simple correlation: all crypto positions are correlated
-    // Sum all shadow positions + new position
-    let totalCorrelated = newSize;
+  private calculateCorrelatedExposure(newSymbol: string, exposureForSymbol: number): number {
+    // exposureForSymbol already includes shadow + real + new for newSymbol
+    // Only add correlated positions from OTHER symbols (with 0.5 correlation)
+    let total = exposureForSymbol;
     for (const [symbol, size] of this.shadowPositions) {
       if (symbol !== newSymbol) {
-        // Assume 0.5 correlation for different symbols
-        totalCorrelated += size * 0.5;
-      } else {
-        totalCorrelated += size;
+        total += size * 0.5;
       }
     }
-    return totalCorrelated;
+    return total;
   }
 
   private validateRiskReward(signal: TradingSignal, currentPrice: number): { valid: boolean; ratio: number } {

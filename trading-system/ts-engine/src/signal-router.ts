@@ -74,9 +74,10 @@ export class SignalRouter {
   private redis: any = null;
   // P2: Signal rate limiting
   private signalTimestamps = new Map<string, number[]>(); // symbol -> [timestamps]
-  private readonly MAX_SIGNALS_PER_MINUTE = 5;
+  private readonly MAX_SIGNALS_PER_MINUTE = 3;
   public signalHistory: Array<{ signalId: string; symbol: string; action: string; confidence: number; positionSize: number; signalPrice: number; accepted: boolean; reason: string; timestamp: number }> = [];
   private readonly MAX_SIGNAL_HISTORY = 200;
+  private _lastPythonAiPing: number = 0;
 
   constructor(config: Config) {
     this.config = config;
@@ -96,7 +97,7 @@ export class SignalRouter {
       maxLeverage: 10,
       kellyFraction: 0.25,
       atrMultiplier: 2,
-      minRiskRewardRatio: 2,
+      minRiskRewardRatio: 1,
       maxDrawdownPct: 0.15,
       trailingStopPct: 0.03,
       scaleInLevels: 3,
@@ -112,9 +113,11 @@ export class SignalRouter {
     if (config.paperTrading) {
       const { PaperTradingAdapter } = require('./dex/paper-trading');
       this.dexAdapter = new PaperTradingAdapter();
+      this.dexAdapter.connect({ dexName: 'paper-trading', testnet: true }).catch(() => {});
       console.log('[SignalRouter] PAPER TRADING MODE enabled');
     } else {
-      this.dexAdapter = createDexAdapter(config.dexProvider);
+      const { LighterAdapter } = require('./dex/lighter');
+      this.dexAdapter = new LighterAdapter(config.lighterBaseUrl!);
     }
     this.signalQueue = new DefaultSignalQueue();
     this.positionTracker = new PositionTracker();
@@ -485,6 +488,71 @@ export class SignalRouter {
     return this.signalHistory;
   }
 
+  getSymbols(): string[] {
+    return this.config.symbols;
+  }
+
+  getLastSignalTimestamp(symbol?: string): number | null {
+    const history = this.getSignalHistory();
+    if (history.length === 0) return null;
+    if (symbol === undefined) return history[0].timestamp;
+    const entry = history.find(s => s.symbol === symbol);
+    return entry ? entry.timestamp : null;
+  }
+
+  getLastPythonAiPing(): number | null {
+    return this._lastPythonAiPing > 0 ? this._lastPythonAiPing : null;
+  }
+
+  getSignalStats(): { total: number; accepted: number; rejected: number; byAction: Record<string, number>; bySymbol: Record<string, number>; acceptedByAction: Record<string, number>; acceptedBySymbol: Record<string, number> } {
+    const history = this.getSignalHistory();
+    let accepted = 0;
+    const byAction: Record<string, number> = {};
+    const bySymbol: Record<string, number> = {};
+    const acceptedByAction: Record<string, number> = {};
+    const acceptedBySymbol: Record<string, number> = {};
+    for (const s of history) {
+      byAction[s.action] = (byAction[s.action] || 0) + 1;
+      bySymbol[s.symbol] = (bySymbol[s.symbol] || 0) + 1;
+      if (s.accepted) {
+        accepted++;
+        acceptedByAction[s.action] = (acceptedByAction[s.action] || 0) + 1;
+        acceptedBySymbol[s.symbol] = (acceptedBySymbol[s.symbol] || 0) + 1;
+      }
+    }
+    return {
+      total: history.length,
+      accepted,
+      rejected: history.length - accepted,
+      byAction,
+      bySymbol,
+      acceptedByAction,
+      acceptedBySymbol,
+    };
+  }
+
+  getConfidenceDistribution(binSize: number = 5): Array<{ min: number; max: number; count: number; accepted: number }> {
+    const history = this.getSignalHistory();
+    const bins: Array<{ min: number; max: number; count: number; accepted: number }> = [];
+    for (let min = 0; min < 100; min += binSize) {
+      const max = Math.min(min + binSize, 100);
+      let count = 0;
+      let accepted = 0;
+      for (const s of history) {
+        if (s.confidence >= min && (max === 100 ? s.confidence <= max : s.confidence < max)) {
+          count++;
+          if (s.accepted) accepted++;
+        }
+      }
+      bins.push({ min, max, count, accepted });
+    }
+    return bins;
+  }
+
+  ping(): void {
+    this._lastPythonAiPing = Date.now();
+  }
+
   setMarketData(stream: MarketDataStream): void {
     this.marketData = stream;
   }
@@ -599,6 +667,7 @@ export class SignalRouter {
     }
 
     const reject = (reason: string): { accepted: false; reason: string } => {
+      console.log(`[SignalRouter] Signal rejected: ${signal.action} ${signal.symbol} - ${reason}`);
       this.recordSignal(signal, { accepted: false, reason });
       return { accepted: false, reason };
     };
@@ -664,18 +733,19 @@ export class SignalRouter {
       marginStatus,
     };
 
-    const riskResult = await this.riskEngine.check(riskInput);
-    if (!riskResult.allowed) {
-      return { accepted: false, reason: riskResult.reason };
-    }
-
-    // 去重检查（需要在挂单检查之前，避免重复信号被误判为 PENDING_ORDER_EXISTS）
+    // 去重检查（需要在挂单检查和风控检查之前）
     const now = Date.now();
     const lastSeen = this.seenSignals.get(signal.signalId);
     if (lastSeen && now - lastSeen < this.TTL_MS) {
       return reject('DUPLICATE_SIGNAL');
     }
     this.seenSignals.set(signal.signalId, now);
+
+    const riskResult = await this.riskEngine.check(riskInput);
+    if (!riskResult.allowed) {
+      console.log(`[SignalRouter] Risk check rejected: ${riskResult.reason}`);
+      return reject(riskResult.reason);
+    }
 
     // Position check: close without position, or duplicate direction
     const pos = realPositions.get(signal.symbol);
@@ -771,8 +841,22 @@ export class SignalRouter {
       price: currentPriceData.lastPrice,
     };
 
+    // 同步到 positionTracker（必须在 submitOrder 之前，确保 handleOrderUpdate 能正确移除）
+    this.positionTracker.addOpenOrder(order.clientOrderId, {
+      orderId: '',
+      symbol: order.symbol,
+      side: order.side,
+      size: order.size,
+      price: order.limitPrice,
+      stopLoss: order.stopLoss || undefined,
+      takeProfit: order.takeProfit || undefined,
+      status: 'pending',
+      createdAt: Date.now(),
+    });
+
     const exchangeOrderId = await this.dexAdapter.submitOrder(dexOrderInput).catch(err => {
       console.error(`[SignalRouter] Order submission failed:`, (err as Error).message);
+      this.positionTracker.removeOpenOrder(order.clientOrderId);
       return null;
     });
 
@@ -814,19 +898,6 @@ export class SignalRouter {
       createdAt: Date.now(),
       updatedAt: Date.now(),
       expiresAt,
-    });
-
-    // 同步到 positionTracker
-    this.positionTracker.addOpenOrder(order.clientOrderId, {
-      orderId: exchangeOrderId,
-      symbol: order.symbol,
-      side: order.side,
-      size: order.size,
-      price: order.limitPrice,
-      stopLoss: order.stopLoss || undefined,
-      takeProfit: order.takeProfit || undefined,
-      status: 'submitted',
-      createdAt: Date.now(),
     });
 
     console.log(`[SignalRouter] Order submitted: ${order.clientOrderId} -> ${exchangeOrderId}`);
