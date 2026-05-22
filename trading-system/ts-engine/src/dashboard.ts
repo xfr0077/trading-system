@@ -382,6 +382,10 @@ a{color:var(--cyan);text-decoration:none}
 .action-long{color:var(--green)}
 .action-short{color:var(--red)}
 .action-close{color:var(--text-dim)}
+.two-col{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:10px}
+.pos-long{color:var(--green)}.pos-short{color:var(--red)}
+.trade-filled{color:var(--green)}.trade-cancelled{color:var(--text-dim)}.trade-rejected{color:var(--red)}
+@media(max-width:900px){.two-col{grid-template-columns:1fr}}
 .conf-bar{display:inline-block;width:50px;height:6px;background:rgba(255,255,255,.08);border-radius:3px;vertical-align:middle;margin-right:6px;position:relative;overflow:hidden}
 .conf-bar-fill{height:100%;border-radius:3px;transition:width .3s}
 .conf-bar-fill.high{background:var(--green)}
@@ -491,6 +495,29 @@ a{color:var(--cyan);text-decoration:none}
     <thead><tr><th>时间</th><th>币种</th><th>动作</th><th>置信度</th><th>接受</th><th>信号价格</th></tr></thead>
     <tbody id="signalsBody"><tr><td colspan="6" class="empty-state">等待信号数据...</td></tr></tbody>
   </table>
+  </div>
+</div>
+
+<div class="section-title" style="margin-top:16px">持仓与交易</div>
+
+<div class="two-col">
+  <div class="card">
+    <h3>当前持仓 <span style="font-weight:400;font-size:11px;color:var(--text-dim)" id="posCount"></span></h3>
+    <div style="max-height:300px;overflow-y:auto">
+    <table class="data-table">
+      <thead><tr><th>币种</th><th>方向</th><th>数量</th><th>开仓价</th><th>未实现盈亏</th></tr></thead>
+      <tbody id="positionsBody"><tr><td colspan="5" class="empty-state">暂无持仓</td></tr></tbody>
+    </table>
+    </div>
+  </div>
+  <div class="card">
+    <h3>交易记录 <span style="font-weight:400;font-size:11px;color:var(--text-dim)" id="tradeCount"></span></h3>
+    <div style="max-height:300px;overflow-y:auto">
+    <table class="data-table">
+      <thead><tr><th>时间</th><th>币种</th><th>方向</th><th>数量</th><th>价格</th><th>状态</th></tr></thead>
+      <tbody id="tradesBody"><tr><td colspan="6" class="empty-state">暂无交易</td></tr></tbody>
+    </table>
+    </div>
   </div>
 </div>
 
@@ -780,6 +807,42 @@ function renderSignalsTable(signals) {
   }
 }
 
+function fetchPositionsAndTrades() {
+  fetch('/api/positions').then(function(r){return r.json()}).then(function(d){
+    var pos = d.positions || [];
+    var tbody = document.getElementById('positionsBody');
+    document.getElementById('posCount').textContent = '(' + pos.length + ')';
+    if (pos.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="5" class="empty-state">暂无持仓</td></tr>';
+    } else {
+      tbody.innerHTML = '';
+      for (var i = 0; i < pos.length; i++) {
+        var p = pos[i];
+        var tr = document.createElement('tr');
+        tr.innerHTML = '<td>' + p.symbol + '</td><td class="pos-' + p.side + '">' + p.side + '</td><td>' + p.size + '</td><td>' + fmtNum(p.entryPrice) + '</td><td>' + (p.unrealizedPnl ? fmt(p.unrealizedPnl, 4) : '0') + '</td>';
+        tbody.appendChild(tr);
+      }
+    }
+  }).catch(function(){});
+  fetch('/api/trades?limit=20').then(function(r){return r.json()}).then(function(d){
+    var trades = d || [];
+    var tbody = document.getElementById('tradesBody');
+    document.getElementById('tradeCount').textContent = '(' + trades.length + ')';
+    if (trades.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="6" class="empty-state">暂无交易</td></tr>';
+    } else {
+      tbody.innerHTML = '';
+      for (var i = 0; i < trades.length; i++) {
+        var t = trades[i];
+        var tr = document.createElement('tr');
+        var statusCls = t.status === 'filled' ? 'trade-filled' : t.status === 'cancelled' ? 'trade-cancelled' : 'trade-rejected';
+        tr.innerHTML = '<td>' + timeAgo(t.createdAt) + '</td><td>' + t.symbol + '</td><td>' + t.side + '</td><td>' + t.size + '</td><td>' + fmtNum(t.limitPrice) + '</td><td class="' + statusCls + '">' + t.status + '</td>';
+        tbody.appendChild(tr);
+      }
+    }
+  }).catch(function(){});
+}
+
 function renderAI() {
   if (!aiData) { return; }
   var signals = getFilteredSignals();
@@ -828,6 +891,7 @@ document.addEventListener('DOMContentLoaded', function() {
     updateModules();
     updateSymbolFilter(modulesData.pythonAi ? modulesData.pythonAi.symbols : null);
     renderAI();
+    fetchPositionsAndTrades();
     updateFooter();
     updateRefreshAgo();
   })['catch'](function(err) {
@@ -854,6 +918,7 @@ evtSource.addEventListener('modules', function(e) {
     connStatus.textContent = '\u5df2\u8fde\u63a5';
     connStatus.className = 'conn-status';
   }
+  fetchPositionsAndTrades();
 });
 evtSource.addEventListener('ai', function(e) {
   try { aiData = JSON.parse(e.data); } catch (err) { console.error('Invalid ai event data', err); return; }
