@@ -82,12 +82,12 @@ export class RiskEngine {
 
   calculateDynamicPositionSize(signal: TradingSignal, currentPrice: number, portfolioValue: number): number {
     const kelly = this.calculateKellyFraction(signal, currentPrice);
-    const volatilityAdjusted = this.adjustForVolatility(signal, currentPrice);
-    const kellySize = portfolioValue * kelly * this.config.kellyFraction;
-    const volSize = portfolioValue * volatilityAdjusted;
-    const dynamicSize = Math.min(kellySize, volSize);
-
-    return Math.min(dynamicSize, this.config.maxPositionSize);
+    const stopDistance = Math.abs(signal.signalPrice - signal.stopLoss);
+    if (stopDistance <= 0) return 0;
+    // Dollar risk = portfolio * kelly. Convert to contracts: risk / stopDistance
+    const riskDollars = portfolioValue * kelly * this.config.kellyFraction;
+    const size = riskDollars / stopDistance;
+    return Math.min(size, this.config.maxPositionSize);
   }
 
   private calculateKellyFraction(signal: TradingSignal, currentPrice: number): number {
