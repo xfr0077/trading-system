@@ -76,6 +76,12 @@ export class SqliteStore {
       );
       CREATE INDEX IF NOT EXISTS idx_trade_history_symbol ON trade_history(symbol);
       CREATE INDEX IF NOT EXISTS idx_trade_history_timestamp ON trade_history(timestamp);
+      CREATE TABLE IF NOT EXISTS signals (
+        signal_id TEXT PRIMARY KEY, symbol TEXT, action TEXT,
+        confidence REAL, position_size REAL, signal_price REAL,
+        accepted INTEGER, reason TEXT, timestamp INTEGER
+      );
+      CREATE INDEX IF NOT EXISTS idx_signals_timestamp ON signals(timestamp);
     `);
     this.persistSync();
 
@@ -286,6 +292,30 @@ export class SqliteStore {
     return rows.map(row => ({
       orderId: row.order_id, symbol: row.symbol, side: row.side,
       size: row.size, price: row.price, fee: row.fee, pnl: row.pnl, timestamp: row.timestamp,
+    }));
+  }
+
+  saveSignal(signal: { signalId: string; symbol: string; action: string; confidence: number; positionSize: number; signalPrice: number; accepted: boolean; reason: string; timestamp: number }): void {
+    if (!this.db) return;
+    this.db.run(
+      `INSERT OR REPLACE INTO signals (signal_id, symbol, action, confidence, position_size, signal_price, accepted, reason, timestamp)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [signal.signalId, signal.symbol, signal.action, signal.confidence, signal.positionSize, signal.signalPrice, signal.accepted ? 1 : 0, signal.reason, signal.timestamp]
+    );
+    this.schedulePersist();
+  }
+
+  getRecentSignals(limit: number = 200): Array<{ signalId: string; symbol: string; action: string; confidence: number; positionSize: number; signalPrice: number; accepted: boolean; reason: string; timestamp: number }> {
+    if (!this.db) return [];
+    const stmt = this.db.prepare('SELECT * FROM signals ORDER BY timestamp DESC LIMIT ?');
+    stmt.bind([limit]);
+    const rows: any[] = [];
+    while (stmt.step()) rows.push(stmt.getAsObject());
+    stmt.free();
+    return rows.map(row => ({
+      signalId: row.signal_id, symbol: row.symbol, action: row.action,
+      confidence: row.confidence, positionSize: row.position_size, signalPrice: row.signal_price,
+      accepted: row.accepted === 1, reason: row.reason || '', timestamp: row.timestamp,
     }));
   }
 

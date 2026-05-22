@@ -216,6 +216,13 @@ export class SignalRouter {
       console.log(`[SignalRouter] Restored ${filledOrders.length} SLTP monitors from database`);
     }
 
+    // 从 SQLite 恢复信号历史
+    const savedSignals = this.sqliteStore.getRecentSignals(this.MAX_SIGNAL_HISTORY);
+    if (savedSignals.length > 0) {
+      this.signalHistory = savedSignals;
+      console.log(`[SignalRouter] Restored ${savedSignals.length} signals from database`);
+    }
+
     // 连接 DEX Adapter
     const dexConfig: DexConfig = {
       dexName: this.config.dexProvider,
@@ -644,7 +651,7 @@ export class SignalRouter {
   }
 
   private recordSignal(signal: SignalInput, result: { accepted: boolean; reason: string }): void {
-    this.signalHistory.unshift({
+    const record = {
       signalId: signal.signalId,
       symbol: signal.symbol,
       action: signal.action,
@@ -654,10 +661,13 @@ export class SignalRouter {
       accepted: result.accepted,
       reason: result.reason,
       timestamp: Date.now(),
-    });
+    };
+    this.signalHistory.unshift(record);
     if (this.signalHistory.length > this.MAX_SIGNAL_HISTORY) {
       this.signalHistory.length = this.MAX_SIGNAL_HISTORY;
     }
+    // Persist to SQLite so signals survive restarts
+    this.sqliteStore.saveSignal(record);
   }
 
   async handleSignal(signal: SignalInput): Promise<{ accepted: boolean; reason: string }> {
