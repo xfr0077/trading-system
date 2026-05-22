@@ -328,6 +328,17 @@ export class PaperTradingAdapter implements IDexAdapter {
     };
   }
 
+  importState(state: { positions: SimulatedPosition[]; balance: number; orders: SimulatedOrder[]; fills: Fill[] }): void {
+    for (const p of state.positions) {
+      this.positions.set(p.symbol, p);
+    }
+    for (const o of state.orders) {
+      this.orders.set(o.clientOrderId, o);
+    }
+    this.fills = state.fills;
+    this.balance = state.balance;
+  }
+
   async getMidPrice(market: string): Promise<{ midPrice: number; bestBid: number; bestAsk: number; spread: number } | null> {
     // Try Lighter public API first
     const lighterUrl = this.config?.rpcUrl || process.env.LIGHTER_BASE_URL || 'https://mainnet.zklighter.elliot.ai';

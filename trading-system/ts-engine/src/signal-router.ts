@@ -253,6 +253,31 @@ export class SignalRouter {
       const orders = dexOrders.map(o => this.mapDexOpenOrder(o));
       if (dexPositions.length > 0 || dexOrders.length > 0) {
         this.positionTracker.sync(positions, orders);
+      } else {
+        // Restore paper trading positions from SQLite on restart
+        const savedPositions = this.sqliteStore.getAllPositions();
+        if (savedPositions.length > 0) {
+          const activePositions = savedPositions.filter(p => parseFloat(p.size) > 0);
+          if (activePositions.length > 0) {
+            try {
+              const restored = activePositions.map(p => ({
+                symbol: p.symbol, side: p.side as 'long' | 'short',
+                size: parseFloat(p.size), entryPrice: parseFloat(p.entryPrice),
+                currentPrice: parseFloat(p.entryPrice), unrealizedPnl: 0, realizedPnl: parseFloat(p.realizedPnl),
+              }));
+              if (typeof (this.dexAdapter as any).importState === 'function') {
+                (this.dexAdapter as any).importState({ positions: restored, balance: 10000, orders: [], fills: [] });
+              }
+              // Also sync position tracker
+              for (const p of restored) {
+                this.positionTracker.onOrderFilled(p.symbol, p.side === 'long' ? 'buy' : 'sell', p.size, p.entryPrice);
+              }
+              console.log(`[SignalRouter] Restored ${restored.length} positions from SQLite`);
+            } catch (e) {
+              console.warn('[SignalRouter] Failed to restore positions from SQLite:', e);
+            }
+          }
+        }
       }
     } catch (err) {
       console.warn('[SignalRouter] Initial position fetch failed, will rely on polling:', err);
