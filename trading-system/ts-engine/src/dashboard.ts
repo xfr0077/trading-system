@@ -1,6 +1,6 @@
 import http from 'http';
 import { SignalRouter } from './signal-router';
-import { MarketData } from './market-data';
+import { MarketDataStream, MarketData } from './market-data';
 import { Config } from './config';
 
 const SSE_KEEPALIVE_MS = 15000;
@@ -86,6 +86,14 @@ export function startDashboard(router: SignalRouter, port: number, config?: Conf
       return;
     }
 
+    // --- Ping endpoint (before auth - called from python-ai within Docker network) ---
+    if (req.method === 'GET' && path === '/api/ping') {
+      router.ping();
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, timestamp: Date.now() }));
+      return;
+    }
+
     // --- Bearer Token Auth for /api/* routes ---
     if (dashboardToken && path.startsWith('/api/')) {
       const authHeader = req.headers.authorization || '';
@@ -132,30 +140,83 @@ export function startDashboard(router: SignalRouter, port: number, config?: Conf
       return;
     }
 
-    if (path === '/api/paper-stats') {
-      if (process.env.PAPER_TRADING !== 'true') {
-        res.writeHead(404, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Paper trading not enabled' }));
-        return;
+    if (path === '/api/modules') {
+      const mem = process.memoryUsage();
+      const lastPing = router.getLastPythonAiPing();
+      const lastPingAge = lastPing !== null ? Math.floor((Date.now() - lastPing) / 1000) : null;
+      let pyStatus = 'offline';
+      if (lastPingAge !== null && lastPingAge < 60) pyStatus = 'online';
+      else if (lastPingAge !== null && lastPingAge < 300) pyStatus = 'warning';
+
+      const mktStatus = router.getMarketData()?.getConnectionStatus() || 'unknown';
+      const margin = router.getMarginMonitor().getStatus();
+      const signals = router.getSignalHistory();
+      const sltp = router.getSLTPMonitor().getActiveOrders();
+
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        tsEngine: {
+          status: 'healthy',
+          uptime: process.uptime(),
+          version: process.env.npm_package_version || '0.1.0',
+          memoryRss: mem.rss,
+          memoryHeapUsed: mem.heapUsed,
+        },
+        pythonAi: {
+          status: pyStatus,
+          lastPingAge: lastPingAge,
+          symbols: router.getSymbols(),
+          confidenceThreshold: 55,
+          featureWindow: 100,
+          useLegacyFeatures: false,
+        },
+        marketData: {
+          status: mktStatus,
+          symbols: router.getSymbols(),
+        },
+        dex: {
+          provider: config?.dexProvider || process.env.DEX_PROVIDER || 'lighter',
+          paperTrading: config?.paperTrading || process.env.PAPER_TRADING === 'true',
+          accountIndex: process.env.LIGHTER_ACCOUNT_INDEX || '-',
+        },
+        riskEngine: {
+          status: margin.status === 'critical' ? 'critical' : margin.status === 'warning' ? 'warning' : 'normal',
+          dailyLoss: router.getRiskEngine().getDailyLoss(),
+          dailyLossLimit: 20,
+          marginStatus: margin.status,
+          marginRatio: margin.marginRatio || 0,
+          activeSLTP: sltp.length,
+          totalSignals: signals.length,
+          acceptedSignals: signals.filter(s => s.accepted).length,
+        },
+      }));
+      return;
+    }
+
+    if (path === '/api/ai') {
+      const binSize = parseInt(url.searchParams.get('binSize') || '5', 10);
+      const allSignals = router.getSignalHistory();
+      const dist = router.getConfidenceDistribution(binSize);
+
+      const perSymbol: Record<string, any> = {};
+      for (const sym of router.getSymbols()) {
+        const symSignals = allSignals.filter(s => s.symbol === sym);
+        const lastSym = router.getLastSignalTimestamp(sym);
+        perSymbol[sym] = {
+          totalSignals: symSignals.length,
+          acceptedSignals: symSignals.filter(s => s.accepted).length,
+          lastSignalAction: symSignals.length > 0 ? symSignals[0].action : null,
+          lastSignalAgo: lastSym !== null ? Math.floor((Date.now() - lastSym) / 1000) : null,
+        };
       }
-      const dexAdapter = (router as any).dexAdapter;
-      const stats = dexAdapter?.getStats?.() || {};
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify(stats));
-      return;
-    }
 
-    if (path === '/api/positions') {
-      const positions = Array.from(router.getPositionTracker().getPositions().values());
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify(positions));
-      return;
-    }
-
-    if (path === '/api/orders') {
-      const openOrders = Array.from(router.getPositionTracker().getOpenOrders().values());
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify(openOrders));
+      res.end(JSON.stringify({
+        signalStats: router.getSignalStats(),
+        confidenceDistribution: dist,
+        recentSignals: allSignals.slice(0, 50),
+        perSymbol,
+      }));
       return;
     }
 
@@ -169,46 +230,34 @@ export function startDashboard(router: SignalRouter, port: number, config?: Conf
       return;
     }
 
-    if (path === '/api/market') {
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({}));
-      return;
-    }
-
-    if (path === '/api/history') {
-      const recent = router.getSqliteStore().getRecentOrders(100);
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify(recent));
-      return;
-    }
-
-    if (path === '/api/trades') {
-      const symbol = url.searchParams.get('symbol') || undefined;
-      const limit = parseInt(url.searchParams.get('limit') || '100');
-      const trades = router.getSqliteStore().getTradeHistory(symbol, limit);
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify(trades));
-      return;
-    }
-
-    if (path === '/api/stats') {
-      const stats = router.getSqliteStore().getStats();
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify(stats));
-      return;
-    }
-
-    if (path === '/api/sltp') {
-      const active = router.getSLTPMonitor().getActiveOrders();
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify(active));
-      return;
-    }
-
     if (path === '/api/signals') {
       const signals = router.getSignalHistory().slice(0, 100);
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(signals));
+      return;
+    }
+
+    if (path === '/api/positions') {
+      const tracker = router.getPositionTracker();
+      const positions = Array.from(tracker.getPositions().values()).map(p => ({
+        symbol: p.symbol, side: p.side, size: p.size,
+        entryPrice: p.entryPrice, unrealizedPnl: p.unrealizedPnl,
+        realizedPnl: p.realizedPnl, updatedAt: p.updatedAt,
+      }));
+      const openOrders = Array.from(tracker.getOpenOrders().values()).map(o => ({
+        orderId: o.orderId, symbol: o.symbol, side: o.side,
+        size: o.size, price: o.price, status: o.status, createdAt: o.createdAt,
+      }));
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ positions, openOrders }));
+      return;
+    }
+
+    if (path === '/api/trades') {
+      const limit = parseInt(url.searchParams.get('limit') || '50', 10);
+      const trades = router.getSqliteStore().getRecentOrders(limit);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(trades));
       return;
     }
 
@@ -220,18 +269,42 @@ export function startDashboard(router: SignalRouter, port: number, config?: Conf
     console.log(`[Dashboard] http://localhost:${port}`);
   });
 
-  setInterval(async () => {
-    const positions = Array.from(router.getPositionTracker().getPositions().values());
-    const orders = Array.from(router.getPositionTracker().getOpenOrders().values());
+  setInterval(() => {
+    const mem = process.memoryUsage();
+    const lastPing = router.getLastPythonAiPing();
+    const lastPingAge = lastPing !== null ? Math.floor((Date.now() - lastPing) / 1000) : null;
+    let pyStatus = 'offline';
+    if (lastPingAge !== null && lastPingAge < 60) pyStatus = 'online';
+    else if (lastPingAge !== null && lastPingAge < 300) pyStatus = 'warning';
+
+    const margin = router.getMarginMonitor().getStatus();
+    const signals = router.getSignalHistory();
     const sltp = router.getSLTPMonitor().getActiveOrders();
-    const stats = router.getSqliteStore().getStats();
-    const signals = router.getSignalHistory().slice(0, 20);
-    broadcast('positions', positions);
-    broadcast('orders', orders);
-    broadcast('sltp', sltp);
-    broadcast('stats', stats);
-    broadcast('signals', signals);
-  }, 3000);
+
+    // Broadcast modules
+    broadcast('modules', {
+      tsEngine: { status: 'healthy', uptime: process.uptime(), version: process.env.npm_package_version || '0.1.0', memoryRss: process.memoryUsage().rss, memoryHeapUsed: process.memoryUsage().heapUsed },
+      pythonAi: { status: pyStatus, lastPingAge, symbols: router.getSymbols(), confidenceThreshold: 55, featureWindow: 100, useLegacyFeatures: false },
+      marketData: { status: router.getMarketData()?.getConnectionStatus() || 'unknown', symbols: router.getSymbols() },
+      dex: { provider: config?.dexProvider || process.env.DEX_PROVIDER || 'lighter', paperTrading: config?.paperTrading || process.env.PAPER_TRADING === 'true', accountIndex: process.env.LIGHTER_ACCOUNT_INDEX || '-' },
+      riskEngine: { status: margin.status === 'critical' ? 'critical' : margin.status === 'warning' ? 'warning' : 'normal', dailyLoss: router.getRiskEngine().getDailyLoss(), dailyLossLimit: 20, marginStatus: margin.status, marginRatio: margin.marginRatio || 0, activeSLTP: sltp.length, totalSignals: signals.length, acceptedSignals: signals.filter(s => s.accepted).length },
+    });
+
+    // Broadcast AI data
+    const perSymbol: Record<string, any> = {};
+    for (const sym of router.getSymbols()) {
+      const symSignals = signals.filter(s => s.symbol === sym);
+      const lastSym = router.getLastSignalTimestamp(sym);
+      perSymbol[sym] = { totalSignals: symSignals.length, acceptedSignals: symSignals.filter(s => s.accepted).length, lastSignalAction: symSignals.length > 0 ? symSignals[0].action : null, lastSignalAgo: lastSym !== null ? Math.floor((Date.now() - lastSym) / 1000) : null };
+    }
+
+    broadcast('ai', {
+      signalStats: router.getSignalStats(),
+      confidenceDistribution: router.getConfidenceDistribution(5),
+      recentSignals: signals.slice(0, 50),
+      perSymbol,
+    });
+  }, 5000);  // 5s 间隔
 
   return server;
 }
@@ -241,242 +314,565 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>交易引擎 Dashboard</title>
+<title>系统监控 Dashboard</title>
 <style>
+:root{--bg:#1a1a2e;--bg-card:#16213e;--border:#0f3460;--text:#e0e0e0;--text-dim:#8892b0;--cyan:#00d2ff;--green:#00e676;--red:#ff6b6b;--yellow:#ffa726;--radius:8px}
 *{margin:0;padding:0;box-sizing:border-box}
-body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#f5f6f8;color:#1a1a2e;padding:0;font-size:13px;min-height:100vh}
-.header{background:#fff;border-bottom:1px solid #e2e8f0;padding:14px 24px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;box-shadow:0 1px 3px rgba(0,0,0,.04)}
+body{font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(--text);font-size:13px;line-height:1.5;min-height:100vh;overflow-x:hidden}
+::-webkit-scrollbar{width:6px}
+::-webkit-scrollbar-track{background:var(--bg)}
+::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
+a{color:var(--cyan);text-decoration:none}
+.header{display:flex;align-items:center;justify-content:space-between;padding:14px 24px;background:var(--bg-card);border-bottom:1px solid var(--border);position:sticky;top:0;z-index:100}
 .header-left{display:flex;align-items:center;gap:12px}
-.header h1{font-size:17px;font-weight:700;color:#1a1a2e}
-.header .sub{font-size:11px;color:#94a3b8}
-.header-right{display:flex;align-items:center;gap:10px}
-.badge{font-size:10px;font-weight:600;padding:3px 10px;border-radius:20px;text-transform:uppercase;letter-spacing:.4px}
-.badge-paper{background:#fef3c7;color:#92400e;border:1px solid #fcd34d}
-.badge-live{background:#d1fae5;color:#065f46;border:1px solid #6ee7b7}
-.content{max-width:1200px;margin:0 auto;padding:16px 24px}
-.grid-4{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px;margin-bottom:14px}
-.card{background:#fff;border:1px solid #e2e8f0;border-radius:10px;padding:16px}
-.card-title{font-size:10px;font-weight:600;color:#94a3b8;text-transform:uppercase;letter-spacing:.6px;margin-bottom:8px;display:flex;align-items:center;gap:6px}
-.card-value{font-size:22px;font-weight:700;font-family:'SF Mono','Fira Code',Consolas,monospace;line-height:1.2;color:#1a1a2e}
-.card-sub{font-size:11px;color:#94a3b8;margin-top:3px}
-.row{display:flex;flex-wrap:wrap;gap:10px;margin-bottom:14px}
-.row>.card{flex:1;min-width:280px}
-.row>.card-wide{flex:3;min-width:550px}
-.stat-grid{display:grid;grid-template-columns:1fr 1fr;gap:6px}
-.stat-item{padding:8px 10px;background:#f8fafc;border-radius:8px;border:1px solid #eef2f6}
-.stat-item .s-label{font-size:10px;color:#94a3b8;margin-bottom:1px}
-.stat-item .s-value{font-size:14px;font-weight:600;font-family:'SF Mono','Fira Code',Consolas,monospace;color:#1a1a2e}
-.data-table{width:100%;border-collapse:collapse;font-size:12px}
-.data-table th{padding:7px 10px;text-align:left;color:#94a3b8;border-bottom:1px solid #e2e8f0;font-weight:600;white-space:nowrap;font-size:10px;text-transform:uppercase;letter-spacing:.4px}
-.data-table td{padding:7px 10px;border-bottom:1px solid #f1f5f9;font-family:'SF Mono','Fira Code',Consolas,monospace;white-space:nowrap;font-size:11px}
-.data-table tbody tr:hover{background:#f8fafc}
-.green{color:#059669}
-.red{color:#dc2626}
-.yellow{color:#b45309}
-.blue{color:#2563eb}
-.dot{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:5px;vertical-align:middle}
-.dot-green{background:#059669}
-.dot-red{background:#dc2626}
-.pill{display:inline-block;padding:2px 8px;border-radius:4px;font-size:10px;font-weight:600}
-.pill-pass{background:#d1fae5;color:#065f46}
-.pill-fail{background:#fee2e2;color:#991b1b}
-.pill-open{background:#dbeafe;color:#1e40af}
-.pill-filled{background:#d1fae5;color:#065f46}
-.pill-cancel{background:#f1f5f9;color:#64748b}
-.empty-state{padding:20px;text-align:center;color:#94a3b8;font-size:12px}
-.uptime{font-size:11px;color:#94a3b8}
-@media(max-width:768px){.header{padding:12px 16px}.content{padding:12px 16px}.row>.card-wide{min-width:100%}.grid-4{grid-template-columns:1fr 1fr}}
+.header h1{font-size:16px;font-weight:700;color:var(--cyan);letter-spacing:.3px}
+.version{font-size:11px;color:var(--text-dim);font-family:'SF Mono',Consolas,monospace}
+.badge{font-size:9px;font-weight:700;padding:2px 8px;border-radius:10px;text-transform:uppercase;letter-spacing:.5px}
+.badge-paper{background:rgba(255,167,38,.15);color:var(--yellow);border:1px solid rgba(255,167,38,.3)}
+.badge-live{background:rgba(0,230,118,.12);color:var(--green);border:1px solid rgba(0,230,118,.3)}
+.header-right{display:flex;align-items:center;gap:10px;font-size:11px;color:var(--text-dim)}
+.content{max-width:1400px;margin:0 auto;padding:16px 20px}
+.cards-grid{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin-bottom:16px}
+.module-card{background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius);padding:14px;transition:border-color .2s}
+.module-card:hover{border-color:var(--cyan)}
+.module-card .card-header{display:flex;align-items:center;gap:8px;margin-bottom:10px;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;color:var(--text-dim)}
+.module-card .card-body{display:flex;flex-direction:column;gap:5px}
+.module-card .stat{display:flex;justify-content:space-between;align-items:center;font-size:11px}
+.module-card .stat .label{color:var(--text-dim)}
+.module-card .stat .value{font-family:'SF Mono',Consolas,monospace;font-size:12px;font-weight:600;color:var(--text)}
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%;flex-shrink:0}
+.dot-green{background:var(--green);box-shadow:0 0 6px rgba(0,230,118,.4)}
+.dot-yellow{background:var(--yellow);box-shadow:0 0 6px rgba(255,167,38,.4)}
+.dot-red{background:var(--red);box-shadow:0 0 6px rgba(255,107,107,.4)}
+.dot-cyan{background:var(--cyan);box-shadow:0 0 6px rgba(0,210,255,.4)}
+.section-title{font-size:14px;font-weight:700;color:var(--text);margin-bottom:12px;padding-bottom:6px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:8px}
+.filters{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:14px}
+.filters select{background:var(--bg-card);border:1px solid var(--border);color:var(--text);padding:6px 10px;border-radius:4px;font-size:11px;cursor:pointer;outline:none;min-width:100px;font-family:inherit}
+.filters select:focus{border-color:var(--cyan)}
+.filters select option{background:var(--bg-card);color:var(--text)}
+.ai-grid{display:grid;grid-template-columns:320px 1fr;gap:10px;margin-bottom:14px}
+.card{background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius);padding:14px}
+.card h3{font-size:11px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.4px;margin-bottom:10px;padding-bottom:6px;border-bottom:1px solid var(--border)}
+.stats-summary{display:flex;gap:14px;margin-bottom:10px}
+.stats-summary .stat-box{flex:1;text-align:center;padding:8px 4px;background:rgba(255,255,255,.03);border-radius:4px}
+.stats-summary .stat-box .num{font-size:18px;font-weight:700;font-family:'SF Mono',Consolas,monospace}
+.stats-summary .stat-box .lbl{font-size:9px;color:var(--text-dim);margin-top:2px}
+.num-cyan{color:var(--cyan)}
+.num-green{color:var(--green)}
+.num-red{color:var(--red)}
+.stats-breakdown{font-size:11px;margin-top:8px}
+.stats-breakdown .break-row{display:flex;justify-content:space-between;padding:3px 0;border-bottom:1px solid rgba(255,255,255,.04)}
+.stats-breakdown .break-row .b-label{color:var(--text-dim)}
+.stats-breakdown .break-row .b-value{font-family:'SF Mono',Consolas,monospace;font-weight:600}
+.stats-scroll{max-height:180px;overflow-y:auto;margin-top:4px}
+.chart-area{padding:2px 0}
+.chart-row{display:flex;align-items:center;gap:6px;margin-bottom:3px;font-size:10px}
+.chart-label{width:48px;text-align:right;color:var(--text-dim);flex-shrink:0;font-family:'SF Mono',Consolas,monospace;font-size:9px}
+.chart-bar-wrap{flex:1;height:16px;background:rgba(255,255,255,.05);border-radius:3px;overflow:hidden;position:relative}
+.chart-bar-fill{height:100%;background:rgba(255,255,255,.08);border-radius:3px;position:relative;transition:width .3s}
+.chart-bar-accepted{position:absolute;left:0;top:0;height:100%;background:var(--green);border-radius:3px;transition:width .3s}
+.chart-count{width:28px;text-align:right;font-family:'SF Mono',Consolas,monospace;color:var(--text)}
+.chart-accepted{width:30px;text-align:right;font-family:'SF Mono',Consolas,monospace;color:var(--text-dim);font-size:9px}
+.data-table{width:100%;border-collapse:collapse;font-size:11px}
+.data-table th{padding:6px 8px;text-align:left;color:var(--text-dim);border-bottom:1px solid var(--border);font-weight:600;white-space:nowrap;font-size:9px;text-transform:uppercase;letter-spacing:.4px}
+.data-table td{padding:6px 8px;border-bottom:1px solid rgba(255,255,255,.04);font-family:'SF Mono',Consolas,monospace;white-space:nowrap;font-size:11px}
+.data-table tbody tr:hover{background:rgba(0,210,255,.04)}
+.data-table .empty-state{padding:24px;text-align:center;color:var(--text-dim);font-size:11px;font-family:inherit}
+.signal-action{font-weight:600}
+.action-long{color:var(--green)}
+.action-short{color:var(--red)}
+.action-close{color:var(--text-dim)}
+.conf-bar{display:inline-block;width:50px;height:6px;background:rgba(255,255,255,.08);border-radius:3px;vertical-align:middle;margin-right:6px;position:relative;overflow:hidden}
+.conf-bar-fill{height:100%;border-radius:3px;transition:width .3s}
+.conf-bar-fill.high{background:var(--green)}
+.conf-bar-fill.mid{background:var(--yellow)}
+.conf-bar-fill.low{background:var(--red)}
+.footer{text-align:center;padding:12px;font-size:10px;color:var(--text-dim);border-top:1px solid var(--border);margin-top:16px;display:flex;justify-content:center;gap:20px}
+.footer span{display:inline-flex;align-items:center;gap:4px}
+.conn-status{color:var(--green)}
+.conn-disconnected{color:var(--red)}
+.loading-pulse{animation:pulse 1.5s ease-in-out infinite}
+@keyframes pulse{0%,100%{opacity:.4}50%{opacity:1}}
+@media(max-width:1000px){.cards-grid{grid-template-columns:repeat(3,1fr)}.ai-grid{grid-template-columns:1fr}}
+@media(max-width:600px){.cards-grid{grid-template-columns:1fr 1fr}.header{padding:10px 14px;flex-wrap:wrap}.content{padding:10px 12px}.filters select{min-width:80px;font-size:10px}}
+@media(max-width:400px){.cards-grid{grid-template-columns:1fr}}
 </style>
 </head>
 <body>
+
 <div class="header">
   <div class="header-left">
-    <h1>交易引擎</h1>
-    <span class="subtitle">v<span id="sysVersion">-</span></span>
+    <h1>系统监控 Dashboard</h1>
+    <span class="version">v<span id="versionVal">-</span></span>
     <span id="modeBadge"></span>
   </div>
-  <div class="header-right">
-    <span class="uptime"><span class="dot dot-green"></span>运行中 · <span id="sysUptime">-</span></span>
-  </div>
+  <div class="header-right"><span>中文</span></div>
 </div>
+
 <div class="content">
 
-<div class="grid-4">
-  <div class="card">
-    <div class="card-title">系统状态</div>
-    <div class="card-value" style="font-size:16px"><span class="dot dot-green"></span>运行中</div>
-    <div class="card-sub">已运行 <span id="sysUptime2">-</span></div>
+<div class="cards-grid" id="cardsGrid">
+  <div class="module-card">
+    <div class="card-header"><span class="dot dot-cyan"></span>ts-engine</div>
+    <div class="card-body">
+      <div class="stat"><span class="label">状态</span><span class="value" id="mTsStatus"><span class="dot dot-green"></span>healthy</span></div>
+      <div class="stat"><span class="label">运行时间</span><span class="value" id="mTsUptime">--:--:--</span></div>
+      <div class="stat"><span class="label">内存</span><span class="value" id="mTsMemory">-</span></div>
+    </div>
   </div>
-  <div class="card">
-    <div class="card-title">模拟盘余额</div>
-    <div class="card-value" id="paperBalance">$10,000</div>
-    <div class="card-sub">总盈亏 <span id="paperPnl">$0</span></div>
+  <div class="module-card">
+    <div class="card-header"><span class="dot dot-green" id="mPyDot"></span>python-ai</div>
+    <div class="card-body">
+      <div class="stat"><span class="label">状态</span><span class="value" id="mPyStatus">-</span></div>
+      <div class="stat"><span class="label">心跳</span><span class="value" id="mPyPing">-</span></div>
+      <div class="stat"><span class="label">监控币种</span><span class="value" id="mPySymbols">-</span></div>
+      <div class="stat"><span class="label">配置</span><span class="value" id="mPyConfig">-</span></div>
+    </div>
   </div>
-  <div class="card">
-    <div class="card-title">风控</div>
-    <div class="card-value" id="dailyLoss">$0</div>
-    <div class="card-sub" id="marginStatus">日亏限额 $20</div>
+  <div class="module-card">
+    <div class="card-header"><span class="dot dot-cyan" id="mMktDot"></span>market-data</div>
+    <div class="card-body">
+      <div class="stat"><span class="label">状态</span><span class="value" id="mMktStatus">-</span></div>
+      <div class="stat"><span class="label">监控币种</span><span class="value" id="mMktSymbols">-</span></div>
+    </div>
   </div>
-  <div class="card">
-    <div class="card-title">交易统计</div>
-    <div class="card-value" id="totalTrades">0</div>
-    <div class="card-sub">胜率 <span id="winRateDisplay">-</span> · 持仓 <span id="posCount2">0</span></div>
+  <div class="module-card">
+    <div class="card-header"><span class="dot dot-cyan"></span>DEX</div>
+    <div class="card-body">
+      <div class="stat"><span class="label">提供商</span><span class="value" id="mDexProvider">-</span></div>
+      <div class="stat"><span class="label">模式</span><span class="value" id="mDexMode">-</span></div>
+      <div class="stat"><span class="label">账户索引</span><span class="value" id="mDexAccount">-</span></div>
+    </div>
   </div>
-</div>
-
-<div class="row">
-  <div class="card">
-    <div class="card-title"><span class="dot dot-green"></span>AI 信号</div>
-    <table class="data-table"><thead><tr><th>时间</th><th>交易对</th><th>方向</th><th>置信度</th><th>数量</th><th>价格</th><th>结果</th><th>原因</th></tr></thead><tbody id="signalsBody"><tr><td colspan="8" class="empty-state">等待 AI 信号...</td></tr></tbody></table>
-  </div>
-</div>
-
-<div class="row">
-  <div class="card card-wide">
-    <div class="card-title">持仓 <span id="posCount" style="font-weight:400;color:#94a3b8;margin-left:4px"></span></div>
-    <table class="data-table"><thead><tr><th>交易对</th><th>方向</th><th>数量</th><th>入场价</th><th>标记价</th><th>浮动盈亏</th><th>收益率</th></tr></thead><tbody id="positionsBody"><tr><td colspan="7" class="empty-state">无持仓</td></tr></tbody></table>
-  </div>
-</div>
-
-<div class="row">
-  <div class="card">
-    <div class="card-title">挂单</div>
-    <table class="data-table"><thead><tr><th>时间</th><th>交易对</th><th>方向</th><th>数量</th><th>价格</th><th>触发价</th><th>状态</th></tr></thead><tbody id="ordersBody"><tr><td colspan="7" class="empty-state">无挂单</td></tr></tbody></table>
-  </div>
-  <div class="card">
-    <div class="card-title">风控详情</div>
-    <div class="stat-grid">
-      <div class="stat-item"><div class="s-label">日亏限额</div><div class="s-value" id="dailyLoss2">$0</div></div>
-      <div class="stat-item"><div class="s-label">影子仓位</div><div class="s-value" id="shadowPos">0</div></div>
-      <div class="stat-item"><div class="s-label">保证金</div><div class="s-value" id="marginStatus2">N/A</div></div>
-      <div class="stat-item"><div class="s-label">并发信号</div><div class="s-value" id="concurrentSignals">0</div></div>
+  <div class="module-card">
+    <div class="card-header"><span class="dot dot-green" id="mRiskDot"></span>风控</div>
+    <div class="card-body">
+      <div class="stat"><span class="label">状态</span><span class="value" id="mRiskStatus">-</span></div>
+      <div class="stat"><span class="label">今日亏损</span><span class="value" id="mRiskLoss">-</span></div>
+      <div class="stat"><span class="label">风控限额</span><span class="value" id="mRiskLimit">-</span></div>
+      <div class="stat"><span class="label">保证金</span><span class="value" id="mRiskMargin">-</span></div>
+      <div class="stat"><span class="label">活跃 SL/TP</span><span class="value" id="mRiskSltp">-</span></div>
     </div>
   </div>
 </div>
 
-<div class="row">
-  <div class="card card-wide">
-    <div class="card-title">交易记录</div>
-    <table class="data-table"><thead><tr><th>时间</th><th>交易对</th><th>方向</th><th>数量</th><th>价格</th><th>手续费</th><th>盈亏</th><th>状态</th></tr></thead><tbody id="historyBody"></tbody></table>
+<div class="section-title">AI 分析</div>
+
+<div class="filters">
+  <select id="filterSymbol"><option value="all">币种: 全部</option></select>
+  <select id="filterAction"><option value="all">动作: 全部</option><option value="long">long</option><option value="short">short</option><option value="close">close</option></select>
+  <select id="filterConfidence"><option value="all">置信度: 全部</option><option value="50">&gt;=50%</option><option value="60">&gt;=60%</option><option value="70">&gt;=70%</option><option value="80">&gt;=80%</option></select>
+  <select id="filterTime"><option value="all">时间: 全部</option><option value="1">最近1小时</option><option value="6">最近6小时</option><option value="24">最近24小时</option></select>
+</div>
+
+<div class="ai-grid">
+  <div class="card" id="signalStatsCard">
+    <h3>信号统计</h3>
+    <div class="stats-summary" id="statsSummary">
+      <div class="stat-box"><div class="num num-cyan" id="statTotal">0</div><div class="lbl">总数</div></div>
+      <div class="stat-box"><div class="num num-green" id="statAccepted">0</div><div class="lbl">已接受</div></div>
+      <div class="stat-box"><div class="num num-red" id="statRejected">0</div><div class="lbl">被拒绝</div></div>
+    </div>
+    <div class="stats-breakdown">
+      <div class="break-row"><span class="b-label">按动作</span><span class="b-value" id="statsByAction">-</span></div>
+      <div class="break-row"><span class="b-label">按币种</span><span class="b-value" id="statsBySymbol">-</span></div>
+    </div>
+  </div>
+  <div class="card">
+    <h3>置信度分布</h3>
+    <div class="chart-area" id="confidenceChart"><div class="loading-pulse" style="text-align:center;color:var(--text-dim);padding:20px">加载中...</div></div>
   </div>
 </div>
 
-</div><!-- content -->
+<div class="card" style="margin-top:10px">
+  <h3>最近信号</h3>
+  <div style="max-height:520px;overflow-y:auto">
+  <table class="data-table">
+    <thead><tr><th>时间</th><th>币种</th><th>动作</th><th>置信度</th><th>接受</th><th>信号价格</th></tr></thead>
+    <tbody id="signalsBody"><tr><td colspan="6" class="empty-state">等待信号数据...</td></tr></tbody>
+  </table>
+  </div>
+</div>
+
+</div>
+
+<div class="footer">
+  <span class="conn-status" id="connStatus">已连接</span>
+  <span>刷新: <span id="refreshAgo">刚刚</span></span>
+  <span>最后更新: <span id="lastUpdateTime">--:--:--</span></span>
+</div>
 
 <script>
-const evtSource = new EventSource('/api/events');
+var modulesData = null;
+var aiData = null;
+var filterSymbol = 'all';
+var filterAction = 'all';
+var filterConfidence = 'all';
+var filterTime = 'all';
+var lastRefresh = Date.now();
+
 function timeAgo(ts) {
-  const s = Math.floor((Date.now() - ts) / 1000);
-  if (s < 5) return '刚刚';
-  if (s < 60) return s + '秒前';
-  if (s < 3600) return Math.floor(s / 60) + '分钟前';
-  return Math.floor(s / 3600) + '小时前';
+  var s = Math.floor((Date.now() - ts) / 1000);
+  if (s < 5) { return '\u521a\u521a'; }
+  if (s < 60) { return s + '\u79d2\u524d'; }
+  if (s < 3600) { return Math.floor(s / 60) + '\u5206\u949f\u524d'; }
+  if (s < 86400) { return Math.floor(s / 3600) + '\u5c0f\u65f6\u524d'; }
+  return Math.floor(s / 86400) + '\u5929\u524d';
 }
 
-function fmt(n, d) { return (parseFloat(n) || 0).toFixed(d ?? 2); }
-function fmtNum(n) { return (parseFloat(n) || 0).toLocaleString('en', {minimumFractionDigits:2,maximumFractionDigits:2}); }
-
-function statusPill(s) {
-  const m = { filled: 'pill-filled', cancelled: 'pill-cancel', rejected: 'pill-fail', submitted: 'pill-open', pending: 'pill-open' };
-  return '<span class="pill ' + (m[s] || 'pill-open') + '">' + s + '</span>';
+function fmtNum(n) {
+  return (parseFloat(n) || 0).toLocaleString('en', {minimumFractionDigits:2, maximumFractionDigits:2});
 }
 
-function updateSignals(signals) {
-  const tbody = document.getElementById('signalsBody');
+function fmt(n, d) {
+  if (d === undefined) { d = 2; }
+  return (parseFloat(n) || 0).toFixed(d);
+}
+
+function formatUptime(sec) {
+  var h = Math.floor(sec / 3600);
+  var m = Math.floor((sec % 3600) / 60);
+  var s = Math.floor(sec % 60);
+  return (h < 10 ? '0' : '') + h + ':' + (m < 10 ? '0' : '') + m + ':' + (s < 10 ? '0' : '') + s;
+}
+
+function formatBytes(b) {
+  if (b < 1024) { return b + ' B'; }
+  if (b < 1048576) { return (b / 1024).toFixed(1) + ' KB'; }
+  if (b < 1073741824) { return (b / 1048576).toFixed(1) + ' MB'; }
+  return (b / 1073741824).toFixed(1) + ' GB';
+}
+
+function updateModules() {
+  if (!modulesData) { return; }
+  var m = modulesData;
+  var ts = m.tsEngine || {};
+  document.getElementById('mTsStatus').innerHTML = '<span class="dot dot-green"></span>' + (ts.status || 'unknown');
+  document.getElementById('mTsUptime').textContent = ts.uptime ? formatUptime(ts.uptime) : '-';
+  document.getElementById('mTsMemory').textContent = ts.memoryRss ? formatBytes(ts.memoryRss) : '-';
+  document.getElementById('versionVal').textContent = ts.version || '-';
+
+  var dex = m.dex || {};
+  var badgeEl = document.getElementById('modeBadge');
+  if (dex.paperTrading) {
+    badgeEl.innerHTML = '<span class="badge badge-paper">PAPER</span>';
+  } else {
+    badgeEl.innerHTML = '<span class="badge badge-live">LIVE</span>';
+  }
+
+  var py = m.pythonAi || {};
+  var pyDot = document.getElementById('mPyDot');
+  var pyStatus = py.status || 'offline';
+  if (pyStatus === 'online') {
+    pyDot.className = 'dot dot-green';
+    document.getElementById('mPyStatus').innerHTML = '<span class="dot dot-green"></span> \u5728\u7ebf';
+  } else if (pyStatus === 'warning') {
+    pyDot.className = 'dot dot-yellow';
+    document.getElementById('mPyStatus').innerHTML = '<span class="dot dot-yellow"></span> \u8b66\u544a';
+  } else {
+    pyDot.className = 'dot dot-red';
+    document.getElementById('mPyStatus').innerHTML = '<span class="dot dot-red"></span> \u79bb\u7ebf';
+  }
+  document.getElementById('mPyPing').textContent = (py.lastPingAge !== null && py.lastPingAge !== undefined) ? timeAgo(Date.now() - py.lastPingAge * 1000) : 'N/A';
+  document.getElementById('mPySymbols').textContent = (py.symbols && py.symbols.length > 0) ? py.symbols.length + ' \u4e2a' : '-';
+  document.getElementById('mPyConfig').textContent = '\u9608\u503c ' + (py.confidenceThreshold || '-') + '%';
+
+  var mkt = m.marketData || {};
+  var mktDot = document.getElementById('mMktDot');
+  var mktConnected = mkt.status === 'connected';
+  mktDot.className = mktConnected ? 'dot dot-green' : 'dot dot-red';
+  document.getElementById('mMktStatus').textContent = mktConnected ? '\u5df2\u8fde\u63a5' : '\u5df2\u65ad\u5f00';
+  document.getElementById('mMktSymbols').textContent = (mkt.symbols && mkt.symbols.length > 0) ? mkt.symbols.length + ' \u4e2a' : '-';
+
+  document.getElementById('mDexProvider').textContent = dex.provider || '-';
+  document.getElementById('mDexMode').textContent = dex.paperTrading ? '\u6a21\u62df\u76d8' : '\u5b9e\u76d8';
+  document.getElementById('mDexAccount').textContent = dex.accountIndex || '-';
+
+  var risk = m.riskEngine || {};
+  var riskDot = document.getElementById('mRiskDot');
+  var riskStatus = risk.status || 'normal';
+  if (riskStatus === 'normal') {
+    riskDot.className = 'dot dot-green';
+    document.getElementById('mRiskStatus').innerHTML = '<span class="dot dot-green"></span> \u6b63\u5e38';
+  } else if (riskStatus === 'warning') {
+    riskDot.className = 'dot dot-yellow';
+    document.getElementById('mRiskStatus').innerHTML = '<span class="dot dot-yellow"></span> \u8b66\u544a';
+  } else {
+    riskDot.className = 'dot dot-red';
+    document.getElementById('mRiskStatus').innerHTML = '<span class="dot dot-red"></span> \u5371\u9669';
+  }
+  var loss = risk.dailyLoss || 0;
+  var lossEl = document.getElementById('mRiskLoss');
+  lossEl.textContent = '$' + fmt(loss, 2);
+  lossEl.style.color = loss > (risk.dailyLossLimit || 20) ? 'var(--red)' : 'var(--text)';
+  document.getElementById('mRiskLimit').textContent = '$' + (risk.dailyLossLimit || 20);
+  var mr = risk.marginRatio || 0;
+  document.getElementById('mRiskMargin').textContent = fmt(mr * 100, 1) + '%';
+  document.getElementById('mRiskSltp').textContent = risk.activeSLTP || 0;
+}
+
+function updateSymbolFilter(symbols) {
+  if (!symbols || symbols.length === 0) { return; }
+  var sel = document.getElementById('filterSymbol');
+  var current = sel.value;
+  sel.innerHTML = '<option value="all">\u5e01\u79cd: \u5168\u90e8</option>';
+  for (var i = 0; i < symbols.length; i++) {
+    var opt = document.createElement('option');
+    opt.value = symbols[i];
+    opt.textContent = symbols[i];
+    sel.appendChild(opt);
+  }
+  if (current !== 'all') {
+    var found = false;
+    for (var j = 0; j < sel.options.length; j++) {
+      if (sel.options[j].value === current) { found = true; break; }
+    }
+    sel.value = found ? current : 'all';
+  }
+}
+
+function getFilteredSignals() {
+  if (!aiData || !aiData.recentSignals) { return []; }
+  var sigs = aiData.recentSignals.slice();
+  if (filterSymbol !== 'all') {
+    sigs = sigs.filter(function(s) { return s.symbol === filterSymbol; });
+  }
+  if (filterAction !== 'all') {
+    sigs = sigs.filter(function(s) { return s.action === filterAction; });
+  }
+  if (filterConfidence !== 'all') {
+    var minConf = parseInt(filterConfidence, 10);
+    sigs = sigs.filter(function(s) { return s.confidence >= minConf; });
+  }
+  if (filterTime !== 'all') {
+    var hours = parseInt(filterTime, 10);
+    var cutoff = Date.now() - hours * 3600000;
+    sigs = sigs.filter(function(s) { return s.timestamp >= cutoff; });
+  }
+  return sigs;
+}
+
+function renderStats(signals) {
+  var total = signals.length;
+  var accepted = 0;
+  var byAction = {};
+  var acceptedByAction = {};
+  var bySymbol = {};
+  var acceptedBySymbol = {};
+
+  for (var i = 0; i < signals.length; i++) {
+    var s = signals[i];
+    byAction[s.action] = (byAction[s.action] || 0) + 1;
+    bySymbol[s.symbol] = (bySymbol[s.symbol] || 0) + 1;
+    if (s.accepted) {
+      accepted++;
+      acceptedByAction[s.action] = (acceptedByAction[s.action] || 0) + 1;
+      acceptedBySymbol[s.symbol] = (acceptedBySymbol[s.symbol] || 0) + 1;
+    }
+  }
+  var rejected = total - accepted;
+
+  document.getElementById('statTotal').textContent = total;
+  document.getElementById('statAccepted').textContent = accepted;
+  document.getElementById('statRejected').textContent = rejected;
+
+  var actionParts = [];
+  var actions = ['long', 'short', 'close'];
+  for (var a = 0; a < actions.length; a++) {
+    var act = actions[a];
+    var actTotal = byAction[act] || 0;
+    var actAcc = acceptedByAction[act] || 0;
+    if (actTotal > 0) {
+      actionParts.push(act + ' ' + actTotal + ' (' + actAcc + ')');
+    }
+  }
+  document.getElementById('statsByAction').textContent = actionParts.length > 0 ? actionParts.join(', ') : '-';
+
+  var symParts = [];
+  var symKeys = Object.keys(bySymbol);
+  symKeys.sort();
+  for (var k = 0; k < symKeys.length; k++) {
+    var sym = symKeys[k];
+    var symTotal = bySymbol[sym];
+    var symAcc = acceptedBySymbol[sym] || 0;
+    symParts.push(sym + ' ' + symTotal + ' (' + symAcc + ')');
+  }
+  document.getElementById('statsBySymbol').textContent = symParts.length > 0 ? symParts.join(', ') : '-';
+}
+
+function renderConfidenceChart(signals) {
+  var binSize = 5;
+  var numBins = Math.ceil(100 / binSize);
+  var bins = [];
+  for (var i = 0; i < numBins; i++) {
+    bins.push({ min: i * binSize, max: Math.min((i + 1) * binSize, 100), count: 0, accepted: 0 });
+  }
+  for (var j = 0; j < signals.length; j++) {
+    var s2 = signals[j];
+    var idx = Math.min(Math.floor(s2.confidence / binSize), numBins - 1);
+    bins[idx].count++;
+    if (s2.accepted) { bins[idx].accepted++; }
+  }
+  var maxCount = 1;
+  for (var b = 0; b < bins.length; b++) {
+    if (bins[b].count > maxCount) { maxCount = bins[b].count; }
+  }
+  var html = '';
+  for (var c = 0; c < bins.length; c++) {
+    var bin = bins[c];
+    var pct = (bin.count / maxCount) * 100;
+    var acceptPct = bin.count > 0 ? (bin.accepted / bin.count) * 100 : 0;
+    var barStyle = 'width:' + pct.toFixed(1) + '%';
+    var acceptStyle = 'width:' + acceptPct.toFixed(1) + '%';
+    html += '<div class="chart-row"><span class="chart-label">' + bin.min + '-' + bin.max + '</span><div class="chart-bar-wrap"><div class="chart-bar-fill" style="' + barStyle + '"><div class="chart-bar-accepted" style="' + acceptStyle + '"></div></div></div><span class="chart-count">' + bin.count + '</span><span class="chart-accepted">[' + bin.accepted + ']</span></div>';
+  }
+  document.getElementById('confidenceChart').innerHTML = html;
+}
+
+function renderSignalsTable(signals) {
+  var tbody = document.getElementById('signalsBody');
   if (!signals || signals.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="8" class="empty-state">等待 AI 信号...</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="6" class="empty-state">\u65e0\u5339\u914d\u4fe1\u53f7</td></tr>';
     return;
   }
-  const aMap = { long: '做多', short: '做空', close: '平仓' };
-  tbody.innerHTML = signals.map(s => {
-    const ok = s.accepted;
-    return '<tr><td>' + timeAgo(s.timestamp) + '</td><td>' + s.symbol + '</td><td class="' + (s.action === 'long' ? 'green' : 'red') + '">' + (aMap[s.action] || s.action) + '</td><td>' + fmt(s.confidence, 0) + '%</td><td>' + s.positionSize + '</td><td>' + fmtNum(s.signalPrice) + '</td><td><span class="pill ' + (ok ? 'pill-pass' : 'pill-fail') + '">' + (ok ? '通过' : '拒绝') + '</span></td><td style="color:' + (ok ? '#059669' : '#dc2626') + '">' + (s.reason || '-') + '</td></tr>';
-  }).join('');
-}
+  var aMap = { long: '\u505a\u591a', short: '\u505a\u7a7a', close: '\u5e73\u4ed3' };
+  tbody.innerHTML = '';
+  for (var i = 0; i < signals.length; i++) {
+    var s = signals[i];
+    var tr = document.createElement('tr');
 
-evtSource.addEventListener('signals', e => updateSignals(JSON.parse(e.data)));
+    var td1 = document.createElement('td');
+    td1.textContent = timeAgo(s.timestamp);
+    tr.appendChild(td1);
 
-evtSource.addEventListener('positions', e => {
-  const positions = JSON.parse(e.data);
-  document.getElementById('posCount').textContent = positions.length ? '(' + positions.length + ')' : '';
-  document.getElementById('posCount2').textContent = positions.length;
-  const tbody = document.getElementById('positionsBody');
-  if (!positions.length) { tbody.innerHTML = '<tr><td colspan="7" class="empty-state">无持仓</td></tr>'; return; }
-  const m = { long: '多头', short: '空头', buy: '买入', sell: '卖出' };
-  tbody.innerHTML = positions.map(p => {
-    const upnl = parseFloat(p.unrealizedPnl || 0);
-    const entry = parseFloat(p.entryPrice || 0);
-    const sz = parseFloat(p.size || 1);
-    const mark = entry + (p.side === 'long' ? upnl / sz : -upnl / sz);
-    const roi = entry > 0 ? (upnl / (entry * sz)) * 100 : 0;
-    return '<tr><td>' + p.symbol + '</td><td class="' + (p.side === 'long' || p.side === 'buy' ? 'green' : 'red') + '">' + (m[p.side] || p.side) + '</td><td>' + sz + '</td><td>' + fmtNum(entry) + '</td><td>' + fmtNum(mark) + '</td><td class="' + (upnl >= 0 ? 'green' : 'red') + '">' + (upnl >= 0 ? '+' : '') + fmtNum(upnl) + '</td><td class="' + (roi >= 0 ? 'green' : 'red') + '">' + (roi >= 0 ? '+' : '') + fmt(roi, 2) + '%</td></tr>';
-  }).join('');
-});
+    var td2 = document.createElement('td');
+    td2.textContent = s.symbol;
+    tr.appendChild(td2);
 
-evtSource.addEventListener('orders', e => {
-  const orders = JSON.parse(e.data);
-  const tbody = document.getElementById('ordersBody');
-  if (!orders.length) { tbody.innerHTML = '<tr><td colspan="7" class="empty-state">无挂单</td></tr>'; return; }
-  const m = { long: '多头', short: '空头', buy: '买入', sell: '卖出' };
-  tbody.innerHTML = orders.map(o => '<tr><td>' + timeAgo(o.createdAt) + '</td><td>' + o.symbol + '</td><td class="' + (o.side === 'buy' ? 'green' : 'red') + '">' + (m[o.side] || o.side) + '</td><td>' + o.size + '</td><td>' + fmtNum(o.price) + '</td><td>' + (o.stopLoss ? fmtNum(o.stopLoss) : o.takeProfit ? fmtNum(o.takeProfit) : '-') + '</td><td>' + statusPill(o.status) + '</td></tr>').join('');
-});
+    var actionClass = s.action === 'long' ? 'action-long' : s.action === 'short' ? 'action-short' : 'action-close';
+    var td3 = document.createElement('td');
+    td3.className = 'signal-action ' + actionClass;
+    td3.textContent = aMap[s.action] || s.action;
+    tr.appendChild(td3);
 
-async function loadStatic() {
-  const [status, risk, history, signals] = await Promise.all([
-    fetch('/api/status').then(r => r.json()),
-    fetch('/api/risk').then(r => r.json()),
-    fetch('/api/history').then(r => r.json()),
-    fetch('/api/signals').then(r => r.json()),
-  ]);
+    var confInt = Math.round(s.confidence);
+    var confClass = confInt >= 70 ? 'high' : confInt >= 50 ? 'mid' : 'low';
+    var td4 = document.createElement('td');
+    var confBar = document.createElement('div');
+    confBar.className = 'conf-bar';
+    var confFill = document.createElement('div');
+    confFill.className = 'conf-bar-fill ' + confClass;
+    confFill.style.width = confInt + '%';
+    confBar.appendChild(confFill);
+    td4.appendChild(confBar);
+    td4.appendChild(document.createTextNode(confInt + '%'));
+    tr.appendChild(td4);
 
-  // Header
-  document.getElementById('sysUptime').textContent = Math.floor(status.uptime / 60) + ' 分钟';
-  document.getElementById('sysVersion').textContent = status.version;
-  document.getElementById('sysUptime2').textContent = Math.floor(status.uptime / 60) + ' 分钟';
+    var td5 = document.createElement('td');
+    td5.textContent = s.accepted ? '\u2705' : '\u274c';
+    tr.appendChild(td5);
 
-  // Risk
-  document.getElementById('dailyLoss').textContent = '$' + fmt((risk.dailyLoss || 0), 0);
-  const mt = risk.margin || {};
-  let msText = '日亏限额 $20';
-  if (mt.status) {
-    msText = mt.status === 'normal' ? '保证金正常' : mt.status === 'warning' ? '保证金警告' : '保证金危险';
-    const pct = fmt((mt.marginRatio || 0) * 100, 1);
-    msText += ' (' + pct + '%)';
-  }
-  document.getElementById('marginStatus').textContent = msText;
+    var td6 = document.createElement('td');
+    td6.textContent = s.signalPrice ? fmtNum(s.signalPrice) : '-';
+    tr.appendChild(td6);
 
-  // Mode badge
-  const badge = document.getElementById('modeBadge');
-  if (status.paperTrading) {
-    badge.innerHTML = '<span class="badge badge-paper">PAPER</span>';
-    try {
-      const ps = await fetch('/api/paper-stats').then(r => r.json());
-      document.getElementById('paperBalance').textContent = '$' + fmtNum(ps.balance || 10000);
-      const pnl = ps.totalPnl || 0;
-      const pnlEl = document.getElementById('paperPnl');
-      pnlEl.textContent = (pnl >= 0 ? '+' : '') + '$' + fmtNum(pnl);
-      pnlEl.style.color = pnl >= 0 ? '#059669' : '#dc2626';
-      document.getElementById('totalTrades').textContent = ps.totalTrades || 0;
-      document.getElementById('winRateDisplay').textContent = ps.winRate ? fmt(ps.winRate * 100, 1) + '%' : '-';
-    } catch {}
-  } else {
-    badge.innerHTML = '<span class="badge badge-live">实盘</span>';
-  }
-
-  // Signals
-  updateSignals(signals);
-
-  // History
-  const m = { long: '多头', short: '空头', buy: '买入', sell: '卖出' };
-  const hbody = document.getElementById('historyBody');
-  if (history && history.length > 0) {
-    hbody.innerHTML = history.map(o => '<tr><td>' + timeAgo(o.updatedAt || o.createdAt) + '</td><td>' + o.symbol + '</td><td class="' + (o.side === 'buy' ? 'green' : 'red') + '">' + (m[o.side] || o.side) + '</td><td>' + o.size + '</td><td>' + fmtNum(parseFloat(o.limitPrice || '0')) + '</td><td>' + (o.fee && o.fee !== '0' ? '$' + fmtNum(parseFloat(o.fee)) : '-') + '</td><td class="' + (parseFloat(o.pnl || 0) >= 0 ? 'green' : 'red') + '">' + (o.pnl && o.pnl !== '0' ? (parseFloat(o.pnl) >= 0 ? '+' : '') + '$' + fmtNum(parseFloat(o.pnl)) : '-') + '</td><td>' + statusPill(o.status) + '</td></tr>').join('');
-  } else {
-    hbody.innerHTML = '<tr><td colspan="8" class="empty-state">暂无交易记录</td></tr>';
+    tbody.appendChild(tr);
   }
 }
-loadStatic();
-setInterval(loadStatic, 10000);
+
+function renderAI() {
+  if (!aiData) { return; }
+  var signals = getFilteredSignals();
+  renderStats(signals);
+  renderConfidenceChart(signals);
+  renderSignalsTable(signals);
+}
+
+function updateFooter() {
+  var now = new Date();
+  var h = now.getHours();
+  var mi = now.getMinutes();
+  var s = now.getSeconds();
+  document.getElementById('lastUpdateTime').textContent = (h < 10 ? '0' : '') + h + ':' + (mi < 10 ? '0' : '') + mi + ':' + (s < 10 ? '0' : '') + s;
+}
+
+function updateRefreshAgo() {
+  document.getElementById('refreshAgo').textContent = timeAgo(lastRefresh);
+}
+
+function setupFilters() {
+  var filterIds = ['filterSymbol', 'filterAction', 'filterConfidence', 'filterTime'];
+  for (var i = 0; i < filterIds.length; i++) {
+    var el = document.getElementById(filterIds[i]);
+    if (el) {
+      el.addEventListener('change', function() {
+        filterSymbol = document.getElementById('filterSymbol').value;
+        filterAction = document.getElementById('filterAction').value;
+        filterConfidence = document.getElementById('filterConfidence').value;
+        filterTime = document.getElementById('filterTime').value;
+        renderAI();
+      });
+    }
+  }
+}
+
+document.addEventListener('DOMContentLoaded', function() {
+  setupFilters();
+  Promise.all([
+    fetch('/api/modules').then(function(r) { return r.json(); }),
+    fetch('/api/ai').then(function(r) { return r.json(); })
+  ]).then(function(results) {
+    modulesData = results[0];
+    aiData = results[1];
+    lastRefresh = Date.now();
+    updateModules();
+    updateSymbolFilter(modulesData.pythonAi ? modulesData.pythonAi.symbols : null);
+    renderAI();
+    updateFooter();
+    updateRefreshAgo();
+  })['catch'](function(err) {
+    console.error('Initial load failed', err);
+  });
+});
+
+var connStatus = document.getElementById('connStatus');
+var evtSource = new EventSource('/api/events');
+evtSource.onerror = function() {
+  if (connStatus) {
+    connStatus.textContent = '\u65ad\u5f00\u8fde\u63a5';
+    connStatus.className = 'conn-status conn-disconnected';
+  }
+};
+evtSource.addEventListener('modules', function(e) {
+  try { modulesData = JSON.parse(e.data); } catch (err) { console.error('Invalid modules event data', err); return; }
+  lastRefresh = Date.now();
+  updateModules();
+  updateSymbolFilter(modulesData.pythonAi ? modulesData.pythonAi.symbols : null);
+  updateFooter();
+  updateRefreshAgo();
+  if (connStatus) {
+    connStatus.textContent = '\u5df2\u8fde\u63a5';
+    connStatus.className = 'conn-status';
+  }
+});
+evtSource.addEventListener('ai', function(e) {
+  try { aiData = JSON.parse(e.data); } catch (err) { console.error('Invalid ai event data', err); return; }
+  lastRefresh = Date.now();
+  renderAI();
+  updateFooter();
+  updateRefreshAgo();
+  if (connStatus) {
+    connStatus.textContent = '\u5df2\u8fde\u63a5';
+    connStatus.className = 'conn-status';
+  }
+});
+
+window.addEventListener('beforeunload', function() { evtSource.close(); });
+
+setInterval(function() {
+  updateRefreshAgo();
+}, 10000);
 </script>
+
 </body>
 </html>`;

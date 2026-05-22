@@ -927,6 +927,18 @@ export class SignalRouter {
       this.sqliteStore.updatePosition(order.symbol, order.side === 'buy' ? 'long' : 'short', String(order.size), String(order.limitPrice));
       this.timeoutManager.cancel(order.clientOrderId);
 
+      // Record trade history for every fill
+      this.sqliteStore.addTradeHistory({
+        orderId: order.orderId || order.clientOrderId,
+        symbol: order.symbol,
+        side: order.side,
+        size: String(order.size),
+        price: String(order.limitPrice),
+        fee: update.fee,
+        pnl: '0',
+        timestamp: Date.now(),
+      });
+
       if (order.stopLoss || order.takeProfit) {
         this.sltpMonitor.addOrder({
           orderId: order.orderId,
