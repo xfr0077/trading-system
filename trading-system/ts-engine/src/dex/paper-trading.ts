@@ -4,6 +4,20 @@ import {
   OrderUpdate as DexOrderUpdate, DexCapabilities,
 } from './types';
 
+const SYMBOL_TO_MARKET: Record<string, number> = {
+  'ETH_USDT_Perp': 0, 'BTC_USDT_Perp': 1, 'SOL_USDT_Perp': 2,
+  'ARB_USDT_Perp': 3, 'OP_USDT_Perp': 4, 'DOGE_USDT_Perp': 5,
+  'NEAR_USDT_Perp': 6, 'LINK_USDT_Perp': 7, 'MATIC_USDT_Perp': 8,
+  'AVAX_USDT_Perp': 9, 'AAVE_USDT_Perp': 10, 'UNI_USDT_Perp': 11,
+  'PEPE_USDT_Perp': 12, 'WIF_USDT_Perp': 13, 'INJ_USDT_Perp': 14,
+  'Render_USDT_Perp': 15, 'TAO_USDT_Perp': 16, 'FET_USDT_Perp': 17,
+  'AGIX_USDT_Perp': 18, 'OCEAN_USDT_Perp': 19, 'RNDR_USDT_Perp': 20,
+  'TIA_USDT_Perp': 21, 'SEI_USDT_Perp': 22, 'STRK_USDT_Perp': 23,
+  'WLD_USDT_Perp': 24, 'PYTH_USDT_Perp': 25, 'SUI_USDT_Perp': 26,
+  'APT_USDT_Perp': 27, 'HYPE_USDT_Perp': 28, 'ZK_USDT_Perp': 56,
+  'EIGEN_USDT_Perp': 49, 'CHIP_USDT_Perp': 163,
+};
+
 interface SimulatedPosition {
   symbol: string;
   side: 'long' | 'short';
@@ -312,5 +326,51 @@ export class PaperTradingAdapter implements IDexAdapter {
       totalPnl: this.balance - 10000,
       balance: this.balance,
     };
+  }
+
+  async getMidPrice(market: string): Promise<{ midPrice: number; bestBid: number; bestAsk: number; spread: number } | null> {
+    // Try Lighter public API first
+    const lighterUrl = this.config?.rpcUrl || process.env.LIGHTER_BASE_URL || 'https://mainnet.zklighter.elliot.ai';
+    const marketIndex = SYMBOL_TO_MARKET[market];
+    if (marketIndex !== undefined) {
+      try {
+        const resp = await fetch(`${lighterUrl}/v1/orderbook?market_id=${marketIndex}&depth=1`);
+        if (resp.ok) {
+          const data = await resp.json() as any;
+          const bestBid = parseFloat(data.bids?.[0]?.price || '0');
+          const bestAsk = parseFloat(data.asks?.[0]?.price || '0');
+          if (bestBid > 0 && bestAsk > 0) {
+            return { midPrice: (bestBid + bestAsk) / 2, bestBid, bestAsk, spread: bestAsk - bestBid };
+          }
+        }
+      } catch {
+        // Fall through to Binance
+      }
+    }
+
+    // Fallback: Binance public API (free, no auth needed)
+    const binanceSymbolMap: Record<string, string> = {
+      'BTC_USDT_Perp': 'BTCUSDT',
+      'ETH_USDT_Perp': 'ETHUSDT',
+      'SOL_USDT_Perp': 'SOLUSDT',
+    };
+    const binanceSymbol = binanceSymbolMap[market];
+    if (binanceSymbol) {
+      try {
+        const resp = await fetch(`https://api.binance.com/api/v3/ticker/bookTicker?symbol=${binanceSymbol}`);
+        if (resp.ok) {
+          const data = await resp.json() as any;
+          const bestBid = parseFloat(data.bidPrice || '0');
+          const bestAsk = parseFloat(data.askPrice || '0');
+          if (bestBid > 0 && bestAsk > 0) {
+            return { midPrice: (bestBid + bestAsk) / 2, bestBid, bestAsk, spread: bestAsk - bestBid };
+          }
+        }
+      } catch {
+        // Ignore
+      }
+    }
+
+    return null;
   }
 }

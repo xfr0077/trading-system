@@ -35,7 +35,7 @@ async function main() {
     while (true) {
       try {
         await router.initialize();
-        console.log('[Main] GRVT init succeeded');
+        console.log('[Main] DEX adapter init succeeded');
         return;
       } catch (err) {
         const delay = Math.min(10000 * Math.pow(2, attempt - 1), 120000);

@@ -217,7 +217,6 @@ export class SignalRouter {
     const dexConfig: DexConfig = {
       dexName: this.config.dexProvider,
       testnet: this.config.env === 'testnet',
-      privateKey: this.config.privateKey,
       walletAddress: this.config.walletAddress,
       rpcUrl: this.config.lighterBaseUrl,
       apiKeyIndex: this.config.lighterApiKeyIndex,

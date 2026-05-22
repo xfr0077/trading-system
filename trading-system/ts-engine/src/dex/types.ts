@@ -3,7 +3,6 @@
 export interface DexConfig {
   dexName: string;
   testnet: boolean;
-  privateKey?: string;
   walletAddress?: string;
   rpcUrl?: string;
   wsUrl?: string;

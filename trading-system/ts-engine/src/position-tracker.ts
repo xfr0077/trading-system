@@ -24,9 +24,6 @@ export interface OpenOrderData {
 
 export interface PositionTrackerConfig {
   pollIntervalMs: number;
-  apiKey: string;
-  privateKey: string;
-  tradingAccountId: string;
 }
 
 export class PositionTracker {
@@ -103,7 +100,7 @@ export class PositionTracker {
   sync(rawPositions: Position[], rawOrders: any[]): void {
     console.log('[PositionTracker] sync() raw positions:', JSON.stringify(rawPositions));
     if (rawPositions.length === 0) {
-      console.log('[PositionTracker] GRVT returned empty positions, preserving local tracking');
+      console.log('[PositionTracker] DEX returned empty positions, preserving local tracking');
     } else {
       this.positions.clear();
       for (const p of rawPositions) {

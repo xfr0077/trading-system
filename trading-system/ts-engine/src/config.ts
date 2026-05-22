@@ -1,5 +1,4 @@
 export interface Config {
-  privateKey: string;
   env: string;
   dexProvider: 'lighter' | 'ostium';
   redisUrl: string;
@@ -52,9 +51,6 @@ function validateNonNegativeNumber(value: number, name: string): number {
 }
 
 export function loadConfig(): Config {
-  const privateKey = process.env.GRVT_PRIVATE_KEY || process.env.PRIVATE_KEY;
-  if (!privateKey) throw new Error('GRVT_PRIVATE_KEY or PRIVATE_KEY is required');
-
   const symbols = (process.env.SYMBOLS || 'BTC_USDT_Perp,ETH_USDT_Perp').split(',').map(s => s.trim());
 
   const port = parseInt(process.env.GRPC_PORT || '50051', 10);
@@ -110,8 +106,7 @@ export function loadConfig(): Config {
   const grpcTlsEnabled = process.env.GRPC_TLS_ENABLED === 'true';
 
   return {
-    privateKey,
-    env: process.env.GRVT_ENV || process.env.DEX_ENV || 'testnet',
+    env: process.env.DEX_ENV || 'testnet',
     dexProvider: (process.env.DEX_PROVIDER || process.env.DEX || 'lighter') as 'lighter' | 'ostium',
     redisUrl: process.env.REDIS_URL || 'redis://localhost:6379',
     sqlitePath: process.env.SQLITE_PATH || '/data/trades.db',

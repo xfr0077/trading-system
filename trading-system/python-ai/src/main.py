@@ -108,12 +108,19 @@ async def main():
 
                 # 发送信号
                 latest = buffer[-1]
+                # Direction-aware SL/TP: for short, SL > price, TP < price
+                if action == 'long':
+                    stop_loss = latest.lastPrice * config.stop_loss_pct
+                    take_profit = latest.lastPrice * config.take_profit_pct
+                else:  # short or close
+                    stop_loss = latest.lastPrice * config.take_profit_pct  # SL above price
+                    take_profit = latest.lastPrice * config.stop_loss_pct  # TP below price
                 try:
                     ack = client.send_signal(
                         symbol=data.symbol,
                         action=action,
-                        stop_loss=latest.lastPrice * config.stop_loss_pct,
-                        take_profit=latest.lastPrice * config.take_profit_pct,
+                        stop_loss=stop_loss,
+                        take_profit=take_profit,
                         confidence=confidence,
                         position_size=config.position_size,
                         signal_price=latest.lastPrice,

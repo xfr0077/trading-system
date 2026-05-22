@@ -1,6 +1,7 @@
 FROM docker.m.daocloud.io/python:3.12-slim
 
 ENV PYTHONPATH=/app:/app/src
+ENV PYTHONUNBUFFERED=1
 
 WORKDIR /app
 
