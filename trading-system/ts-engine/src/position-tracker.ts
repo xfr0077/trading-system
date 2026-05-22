@@ -108,7 +108,7 @@ export class PositionTracker {
         if (size > 0) {
           this.positions.set(p.symbol, {
             symbol: p.symbol,
-            side: parseFloat(p.size) < 0 ? 'short' : 'long',
+            side: p.side && p.side !== 'none' ? p.side : (parseFloat(p.size) < 0 ? 'short' : 'long'),
             size,
             entryPrice: parseFloat(p.entryPrice || '0'),
             unrealizedPnl: parseFloat(p.unrealizedPnl || '0'),
