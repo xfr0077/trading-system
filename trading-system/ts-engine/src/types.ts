@@ -50,6 +50,7 @@ export interface OrderUpdate {
   orderId: string;
   status: 'pending' | 'submitted' | 'filled' | 'cancelled' | 'rejected' | 'partially_filled';
   fee: string;
+  fillPrice?: string;
 }
 
 export interface TradeRecord {

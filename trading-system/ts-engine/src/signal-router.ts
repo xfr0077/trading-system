@@ -57,6 +57,7 @@ export { SignalInput };
 
 export class SignalRouter {
   private seenSignals = new Map<string, number>();
+  private seenActions = new Map<string, number>();
   private readonly TTL_MS = 5 * 60 * 1000;
   private cleanupInterval: NodeJS.Timeout | null = null;
   private orderStatusPollInterval: NodeJS.Timeout | null = null;
@@ -129,6 +130,7 @@ export class SignalRouter {
         orderId: update.order.exchangeOrderId,
         status: this.mapDexOrderStatus(update.order.status),
         fee: update.fill ? String(update.fill.fee) : '0',
+        fillPrice: update.order.avgFillPrice ? String(update.order.avgFillPrice) : undefined,
       };
       this.handleOrderUpdate(internalUpdate);
     });
@@ -516,6 +518,10 @@ export class SignalRouter {
     return this.sqliteStore;
   }
 
+  getDexAdapter(): IDexAdapter {
+    return this.dexAdapter;
+  }
+
   getSignalHistory(): Array<{ signalId: string; symbol: string; action: string; confidence: number; positionSize: number; signalPrice: number; accepted: boolean; reason: string; timestamp: number }> {
     return this.signalHistory;
   }
@@ -769,12 +775,21 @@ export class SignalRouter {
     };
 
     // 去重检查（需要在挂单检查和风控检查之前）
+    // 1. 按 signalId 去重
     const now = Date.now();
     const lastSeen = this.seenSignals.get(signal.signalId);
     if (lastSeen && now - lastSeen < this.TTL_MS) {
       return reject('DUPLICATE_SIGNAL');
     }
     this.seenSignals.set(signal.signalId, now);
+
+    // 2. 按 symbol+action 去重窗口（30 秒内同一方向信号只接受一次，防 Python AI 重复发送）
+    const actionKey = `${signal.symbol}:${signal.action}`;
+    const lastActionTime = this.seenActions.get(actionKey);
+    if (lastActionTime && now - lastActionTime < 30_000) {
+      return reject('DUPLICATE_ACTION');
+    }
+    this.seenActions.set(actionKey, now);
 
     const riskResult = await this.riskEngine.check(riskInput);
     if (!riskResult.allowed) {
@@ -835,11 +850,16 @@ export class SignalRouter {
     }
 
     // 创建订单
+    // close 信号使用实际持仓大小开平仓单，而非 dynamicSize
+    const orderSize = processedSignal.action === 'close' && pos
+      ? Math.abs(pos.size)
+      : dynamicSize;
+
     const order = this.orderManager.createOrder({
       signalId: processedSignal.signalId,
       symbol: processedSignal.symbol,
       side: processedSignal.action === 'long' ? 'buy' : 'sell',
-      size: dynamicSize,
+      size: orderSize,
       limitPrice: currentPriceData.lastPrice,
       stopLoss,
       takeProfit,
@@ -957,30 +977,36 @@ export class SignalRouter {
     // 更新 Shadow Position 和持久化
     if (update.status === 'filled') {
       this.riskEngine.updateShadowPosition(order.symbol, -order.size);
-      this.positionTracker.onOrderFilled(order.symbol, order.side, order.size, parseFloat(String(order.limitPrice)));
+
+      // 计算成交盈亏后更新仓位（优先使用 DEX 实际成交价）
+      const fillPrice = parseFloat(update.fillPrice || String(order.limitPrice));
+      const fillPnl = this.positionTracker.onOrderFilled(order.symbol, order.side, order.size, fillPrice);
       this.positionTracker.removeOpenOrder(order.clientOrderId);
       // Correctly update position in SQLite: reduce existing if opposite direction
-      const existingPos = this.sqliteStore.getPosition(order.symbol);
+      // 使用 PositionTracker 的最新数据（含 realizedPnl），确保与内存一致
       const newSide = order.side === 'buy' ? 'long' : 'short';
       const newSize = order.size;
+      const updatedPos = this.positionTracker.getPosition(order.symbol);
+      const realizedPnlStr = updatedPos ? String(updatedPos.realizedPnl.toFixed(2)) : '0';
+      const existingPos = this.sqliteStore.getPosition(order.symbol);
       if (existingPos && parseFloat(existingPos.size) > 0 && existingPos.side !== newSide) {
         // Opposite direction: reduce or close
         const existingSize = parseFloat(existingPos.size);
         const netSize = existingSize - newSize;
         if (netSize <= 0) {
           // Position fully closed
-          this.sqliteStore.updatePosition(order.symbol, existingPos.side, '0', existingPos.entryPrice);
+          this.sqliteStore.updatePosition(order.symbol, existingPos.side, '0', existingPos.entryPrice, realizedPnlStr);
         } else {
           // Partially reduced
-          this.sqliteStore.updatePosition(order.symbol, existingPos.side, String(netSize), existingPos.entryPrice);
+          this.sqliteStore.updatePosition(order.symbol, existingPos.side, String(netSize), existingPos.entryPrice, realizedPnlStr);
         }
       } else {
         // Same direction or new position: add or create
-        this.sqliteStore.updatePosition(order.symbol, newSide, String(newSize), String(order.limitPrice));
+        this.sqliteStore.updatePosition(order.symbol, newSide, String(newSize), String(order.limitPrice), realizedPnlStr);
       }
       this.timeoutManager.cancel(order.clientOrderId);
 
-      // Record trade history for every fill
+      // Record trade history for every fill — 使用 PositionTracker 算出的实际盈亏
       this.sqliteStore.addTradeHistory({
         orderId: order.orderId || order.clientOrderId,
         symbol: order.symbol,
@@ -988,7 +1014,7 @@ export class SignalRouter {
         size: String(order.size),
         price: String(order.limitPrice),
         fee: update.fee,
-        pnl: '0',
+        pnl: String(fillPnl.toFixed(2)),
         timestamp: Date.now(),
       });
 
@@ -1056,7 +1082,19 @@ export class SignalRouter {
             signalPrice: call.request.signalPrice,
             maxSlippageBps: call.request.maxSlippageBps,
           });
-          callback(null, { signal_id: call.request.signalId, accepted: result.accepted, reason: result.reason });
+
+          // 将当前仓位信息返回给 AI，让 AI 感知到自己在做什么
+          const pos = this.positionTracker.getPositions().get(call.request.symbol);
+          const positionPayload = pos && pos.size > 0 ? {
+            symbol: pos.symbol,
+            side: pos.side,
+            size: pos.size,
+            entry_price: pos.entryPrice,
+            unrealized_pnl: pos.unrealizedPnl,
+            realized_pnl: pos.realizedPnl,
+          } : null;
+
+          callback(null, { signal_id: call.request.signalId, accepted: result.accepted, reason: result.reason, position: positionPayload });
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
           console.error(`[SignalRouter] SendSignal error: ${message}`);

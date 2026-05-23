@@ -30,7 +30,7 @@ setInterval(() => {
       rateLimitMap.delete(key);
     }
   }
-}, 120000);
+}, 120000).unref();
 
 interface SSEClient {
   id: number;
@@ -255,9 +255,52 @@ export function startDashboard(router: SignalRouter, port: number, config?: Conf
 
     if (path === '/api/trades') {
       const limit = parseInt(url.searchParams.get('limit') || '50', 10);
-      const trades = router.getSqliteStore().getRecentOrders(limit);
+      const trades = router.getSqliteStore().getTradeHistory(undefined, limit);
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(trades));
+      return;
+    }
+
+    if (path === '/api/summary') {
+      (async () => {
+        try {
+          const tradeHistory = router.getSqliteStore().getTradeHistory(undefined, 10000);
+          const positions = Array.from(router.getPositionTracker().getPositions().values());
+          const allSignals = router.getSignalHistory();
+          const acceptedSignals = allSignals.filter(s => s.accepted).length;
+          const totalTrades = tradeHistory.length;
+          const profitableTrades = tradeHistory.filter(t => parseFloat(t.pnl || '0') > 0).length;
+          const totalPnl = tradeHistory.reduce((sum, t) => sum + parseFloat(t.pnl || '0'), 0);
+          const unrealizedPnl = positions.reduce((sum, p) => sum + p.unrealizedPnl, 0);
+          const todayStart = Date.now() - 24 * 60 * 60 * 1000;
+          const todayTrades = tradeHistory.filter(t => t.timestamp >= todayStart);
+          const todayPnl = todayTrades.reduce((sum, t) => sum + parseFloat(t.pnl || '0'), 0);
+          const openPositions = positions.filter(p => p.size > 0).length;
+          let balance = 0;
+          try {
+            const account = await router.getDexAdapter().getAccount?.();
+            balance = account?.totalBalance || 0;
+          } catch {}
+
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            totalPnl: parseFloat(totalPnl.toFixed(2)),
+            unrealizedPnl: parseFloat(unrealizedPnl.toFixed(2)),
+            totalPnlInclUnrealized: parseFloat((totalPnl + unrealizedPnl).toFixed(2)),
+            todayPnl: parseFloat(todayPnl.toFixed(2)),
+            winRate: totalTrades > 0 ? parseFloat((profitableTrades / totalTrades * 100).toFixed(1)) : 0,
+            totalTrades,
+            todayTrades: todayTrades.length,
+            openPositions,
+            balance: parseFloat(balance.toFixed(2)),
+            signalAcceptRate: allSignals.length > 0 ? parseFloat((acceptedSignals / allSignals.length * 100).toFixed(1)) : 0,
+            dailyLoss: router.getRiskEngine().getDailyLoss(),
+          }));
+        } catch (err) {
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: String(err) }));
+        }
+      })();
       return;
     }
 
@@ -269,26 +312,45 @@ export function startDashboard(router: SignalRouter, port: number, config?: Conf
     console.log(`[Dashboard] http://localhost:${port}`);
   });
 
-  setInterval(() => {
+  const broadcastTimer = setInterval(async () => {
     const mem = process.memoryUsage();
     const lastPing = router.getLastPythonAiPing();
     const lastPingAge = lastPing !== null ? Math.floor((Date.now() - lastPing) / 1000) : null;
-    let pyStatus = 'offline';
-    if (lastPingAge !== null && lastPingAge < 60) pyStatus = 'online';
-    else if (lastPingAge !== null && lastPingAge < 300) pyStatus = 'warning';
-
     const margin = router.getMarginMonitor().getStatus();
     const signals = router.getSignalHistory();
     const sltp = router.getSLTPMonitor().getActiveOrders();
 
-    // Broadcast modules
-    broadcast('modules', {
-      tsEngine: { status: 'healthy', uptime: process.uptime(), version: process.env.npm_package_version || '0.1.0', memoryRss: process.memoryUsage().rss, memoryHeapUsed: process.memoryUsage().heapUsed },
-      pythonAi: { status: pyStatus, lastPingAge, symbols: router.getSymbols(), confidenceThreshold: 55, featureWindow: 100, useLegacyFeatures: false },
-      marketData: { status: router.getMarketData()?.getConnectionStatus() || 'unknown', symbols: router.getSymbols() },
-      dex: { provider: config?.dexProvider || process.env.DEX_PROVIDER || 'lighter', paperTrading: config?.paperTrading || process.env.PAPER_TRADING === 'true', accountIndex: process.env.LIGHTER_ACCOUNT_INDEX || '-' },
-      riskEngine: { status: margin.status === 'critical' ? 'critical' : margin.status === 'warning' ? 'warning' : 'normal', dailyLoss: router.getRiskEngine().getDailyLoss(), dailyLossLimit: 20, marginStatus: margin.status, marginRatio: margin.marginRatio || 0, activeSLTP: sltp.length, totalSignals: signals.length, acceptedSignals: signals.filter(s => s.accepted).length },
-    });
+    // Broadcast compact summary
+    try {
+      const tradeHistory = router.getSqliteStore().getTradeHistory(undefined, 10000);
+      const positions = Array.from(router.getPositionTracker().getPositions().values());
+      const totalPnl = tradeHistory.reduce((sum, t) => sum + parseFloat(t.pnl || '0'), 0);
+      const unrealizedPnl = positions.reduce((sum, p) => sum + p.unrealizedPnl, 0);
+      const todayStart = Date.now() - 24 * 60 * 60 * 1000;
+      const todayPnl = tradeHistory.filter(t => t.timestamp >= todayStart).reduce((sum, t) => sum + parseFloat(t.pnl || '0'), 0);
+      const profitableTrades = tradeHistory.filter(t => parseFloat(t.pnl || '0') > 0).length;
+      const totalTrades = tradeHistory.length;
+      let balance = 0;
+      try { const acct = await router.getDexAdapter().getAccount?.(); balance = acct?.totalBalance || 0; } catch {}
+
+      broadcast('summary', {
+        totalPnl: parseFloat(totalPnl.toFixed(2)),
+        unrealizedPnl: parseFloat(unrealizedPnl.toFixed(2)),
+        totalPnlInclUnrealized: parseFloat((totalPnl + unrealizedPnl).toFixed(2)),
+        todayPnl: parseFloat(todayPnl.toFixed(2)),
+        winRate: totalTrades > 0 ? parseFloat((profitableTrades / totalTrades * 100).toFixed(1)) : 0,
+        totalTrades,
+        openPositions: positions.filter(p => p.size > 0).length,
+        balance: parseFloat(balance.toFixed(2)),
+        activeSLTP: sltp.length,
+        marginStatus: margin.status,
+        marginRatio: margin.marginRatio || 0,
+        dailyLoss: router.getRiskEngine().getDailyLoss(),
+        pyOnline: lastPingAge !== null && lastPingAge < 60,
+        uptime: process.uptime(),
+        version: process.env.npm_package_version || '0.1.0',
+      });
+    } catch {}
 
     // Broadcast AI data
     const perSymbol: Record<string, any> = {};
@@ -304,7 +366,7 @@ export function startDashboard(router: SignalRouter, port: number, config?: Conf
       recentSignals: signals.slice(0, 50),
       perSymbol,
     });
-  }, 5000);  // 5s 间隔
+  }, 5000).unref();  // 5s 间隔
 
   return server;
 }
@@ -317,6 +379,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 <title>系统监控 Dashboard</title>
 <style>
 :root{--bg:#1a1a2e;--bg-card:#16213e;--border:#0f3460;--text:#e0e0e0;--text-dim:#8892b0;--cyan:#00d2ff;--green:#00e676;--red:#ff6b6b;--yellow:#ffa726;--radius:8px}
+html[data-theme="light"]{--bg:#f5f5f5;--bg-card:#ffffff;--border:#d0d0d0;--text:#1a1a2e;--text-dim:#888;--cyan:#0099cc;--green:#00a854;--red:#d32f2f;--yellow:#e65100}
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(--text);font-size:13px;line-height:1.5;min-height:100vh;overflow-x:hidden}
 ::-webkit-scrollbar{width:6px}
@@ -332,14 +395,15 @@ a{color:var(--cyan);text-decoration:none}
 .badge-live{background:rgba(0,230,118,.12);color:var(--green);border:1px solid rgba(0,230,118,.3)}
 .header-right{display:flex;align-items:center;gap:10px;font-size:11px;color:var(--text-dim)}
 .content{max-width:1400px;margin:0 auto;padding:16px 20px}
-.cards-grid{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin-bottom:16px}
-.module-card{background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius);padding:14px;transition:border-color .2s}
-.module-card:hover{border-color:var(--cyan)}
-.module-card .card-header{display:flex;align-items:center;gap:8px;margin-bottom:10px;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;color:var(--text-dim)}
-.module-card .card-body{display:flex;flex-direction:column;gap:5px}
-.module-card .stat{display:flex;justify-content:space-between;align-items:center;font-size:11px}
-.module-card .stat .label{color:var(--text-dim)}
-.module-card .stat .value{font-family:'SF Mono',Consolas,monospace;font-size:12px;font-weight:600;color:var(--text)}
+.cards-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:16px}
+@media(max-width:600px){.cards-grid{grid-template-columns:1fr 1fr}}
+.metric-card{background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius);padding:16px;transition:border-color .2s}
+.metric-card:hover{border-color:var(--cyan)}
+.metric-card .metric-label{font-size:10px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px}
+.metric-card .metric-value{font-size:26px;font-weight:700;font-family:'SF Mono',Consolas,monospace;margin-bottom:6px;line-height:1.2}
+.metric-card .metric-sub{display:flex;gap:16px;font-size:10px;color:var(--text-dim)}
+.metric-card .metric-sub span{display:inline-flex;align-items:center;gap:3px}
+.metric-card .metric-sub b{font-family:'SF Mono',Consolas,monospace;color:var(--text);font-weight:600}
 .dot{display:inline-block;width:8px;height:8px;border-radius:50%;flex-shrink:0}
 .dot-green{background:var(--green);box-shadow:0 0 6px rgba(0,230,118,.4)}
 .dot-yellow{background:var(--yellow);box-shadow:0 0 6px rgba(255,167,38,.4)}
@@ -410,52 +474,42 @@ a{color:var(--cyan);text-decoration:none}
     <span class="version">v<span id="versionVal">-</span></span>
     <span id="modeBadge"></span>
   </div>
-  <div class="header-right"><span>中文</span></div>
+  <div class="header-right"><span id="themeToggle" style="cursor:pointer;user-select:none" onclick="toggleTheme()">🌙 暗色</span></div>
 </div>
 
 <div class="content">
 
 <div class="cards-grid" id="cardsGrid">
-  <div class="module-card">
-    <div class="card-header"><span class="dot dot-cyan"></span>ts-engine</div>
-    <div class="card-body">
-      <div class="stat"><span class="label">状态</span><span class="value" id="mTsStatus"><span class="dot dot-green"></span>healthy</span></div>
-      <div class="stat"><span class="label">运行时间</span><span class="value" id="mTsUptime">--:--:--</span></div>
-      <div class="stat"><span class="label">内存</span><span class="value" id="mTsMemory">-</span></div>
+  <div class="metric-card">
+    <div class="metric-label">总盈亏</div>
+    <div class="metric-value" id="sTotalPnl" style="color:var(--text-dim)">--</div>
+    <div class="metric-sub">
+      <span>已实现 <b id="sRealizedPnl">--</b></span>
+      <span>未实现 <b id="sUnrealizedPnl">--</b></span>
     </div>
   </div>
-  <div class="module-card">
-    <div class="card-header"><span class="dot dot-green" id="mPyDot"></span>python-ai</div>
-    <div class="card-body">
-      <div class="stat"><span class="label">状态</span><span class="value" id="mPyStatus">-</span></div>
-      <div class="stat"><span class="label">心跳</span><span class="value" id="mPyPing">-</span></div>
-      <div class="stat"><span class="label">监控币种</span><span class="value" id="mPySymbols">-</span></div>
-      <div class="stat"><span class="label">配置</span><span class="value" id="mPyConfig">-</span></div>
+  <div class="metric-card">
+    <div class="metric-label">今日</div>
+    <div class="metric-value" id="sTodayPnl" style="color:var(--text-dim)">--</div>
+    <div class="metric-sub">
+      <span>交易 <b id="sTodayTrades">0</b> 笔</span>
+      <span>胜率 <b id="sWinRate">--</b></span>
     </div>
   </div>
-  <div class="module-card">
-    <div class="card-header"><span class="dot dot-cyan" id="mMktDot"></span>market-data</div>
-    <div class="card-body">
-      <div class="stat"><span class="label">状态</span><span class="value" id="mMktStatus">-</span></div>
-      <div class="stat"><span class="label">监控币种</span><span class="value" id="mMktSymbols">-</span></div>
+  <div class="metric-card">
+    <div class="metric-label">持仓</div>
+    <div class="metric-value" id="sOpenPositions" style="color:var(--cyan)">0</div>
+    <div class="metric-sub">
+      <span>余额 <b id="sBalance">--</b></span>
+      <span>总交易 <b id="sTotalTrades">0</b> 笔</span>
     </div>
   </div>
-  <div class="module-card">
-    <div class="card-header"><span class="dot dot-cyan"></span>DEX</div>
-    <div class="card-body">
-      <div class="stat"><span class="label">提供商</span><span class="value" id="mDexProvider">-</span></div>
-      <div class="stat"><span class="label">模式</span><span class="value" id="mDexMode">-</span></div>
-      <div class="stat"><span class="label">账户索引</span><span class="value" id="mDexAccount">-</span></div>
-    </div>
-  </div>
-  <div class="module-card">
-    <div class="card-header"><span class="dot dot-green" id="mRiskDot"></span>风控</div>
-    <div class="card-body">
-      <div class="stat"><span class="label">状态</span><span class="value" id="mRiskStatus">-</span></div>
-      <div class="stat"><span class="label">今日亏损</span><span class="value" id="mRiskLoss">-</span></div>
-      <div class="stat"><span class="label">风控限额</span><span class="value" id="mRiskLimit">-</span></div>
-      <div class="stat"><span class="label">保证金</span><span class="value" id="mRiskMargin">-</span></div>
-      <div class="stat"><span class="label">活跃 SL/TP</span><span class="value" id="mRiskSltp">-</span></div>
+  <div class="metric-card">
+    <div class="metric-label">系统</div>
+    <div class="metric-value" style="display:flex;align-items:center;gap:8px;font-size:20px"><span class="dot" id="sStatusDot"></span><span id="sStatusText">--</span></div>
+    <div class="metric-sub">
+      <span>风控 <b id="sRiskStatus">--</b></span>
+      <span>运行 <b id="sUptime">--:--:--</b></span>
     </div>
   </div>
 </div>
@@ -505,8 +559,8 @@ a{color:var(--cyan);text-decoration:none}
     <h3>当前持仓 <span style="font-weight:400;font-size:11px;color:var(--text-dim)" id="posCount"></span></h3>
     <div style="max-height:300px;overflow-y:auto">
     <table class="data-table">
-      <thead><tr><th>币种</th><th>方向</th><th>数量</th><th>开仓价</th><th>未实现盈亏</th></tr></thead>
-      <tbody id="positionsBody"><tr><td colspan="5" class="empty-state">暂无持仓</td></tr></tbody>
+      <thead><tr><th>币种</th><th>方向</th><th>数量</th><th>开仓价</th><th>未实现盈亏</th><th>已实现盈亏</th></tr></thead>
+      <tbody id="positionsBody"><tr><td colspan="6" class="empty-state">暂无持仓</td></tr></tbody>
     </table>
     </div>
   </div>
@@ -514,7 +568,7 @@ a{color:var(--cyan);text-decoration:none}
     <h3>交易记录 <span style="font-weight:400;font-size:11px;color:var(--text-dim)" id="tradeCount"></span></h3>
     <div style="max-height:300px;overflow-y:auto">
     <table class="data-table">
-      <thead><tr><th>时间</th><th>币种</th><th>方向</th><th>数量</th><th>价格</th><th>状态</th></tr></thead>
+      <thead><tr><th>时间</th><th>币种</th><th>方向</th><th>数量</th><th>价格</th><th>盈亏(PnL)</th></tr></thead>
       <tbody id="tradesBody"><tr><td colspan="6" class="empty-state">暂无交易</td></tr></tbody>
     </table>
     </div>
@@ -530,8 +584,18 @@ a{color:var(--cyan);text-decoration:none}
 </div>
 
 <script>
-var modulesData = null;
+var summaryData = null;
 var aiData = null;
+var currentTheme = localStorage.getItem('dashboardTheme') || 'dark';
+document.documentElement.setAttribute('data-theme', currentTheme);
+document.getElementById('themeToggle').textContent = currentTheme === 'dark' ? '🌙 暗色' : '☀️ 亮色';
+
+function toggleTheme() {
+  currentTheme = currentTheme === 'dark' ? 'light' : 'dark';
+  document.documentElement.setAttribute('data-theme', currentTheme);
+  localStorage.setItem('dashboardTheme', currentTheme);
+  document.getElementById('themeToggle').textContent = currentTheme === 'dark' ? '🌙 暗色' : '☀️ 亮色';
+}
 var filterSymbol = 'all';
 var filterAction = 'all';
 var filterConfidence = 'all';
@@ -570,72 +634,51 @@ function formatBytes(b) {
   return (b / 1073741824).toFixed(1) + ' GB';
 }
 
-function updateModules() {
-  if (!modulesData) { return; }
-  var m = modulesData;
-  var ts = m.tsEngine || {};
-  document.getElementById('mTsStatus').innerHTML = '<span class="dot dot-green"></span>' + (ts.status || 'unknown');
-  document.getElementById('mTsUptime').textContent = ts.uptime ? formatUptime(ts.uptime) : '-';
-  document.getElementById('mTsMemory').textContent = ts.memoryRss ? formatBytes(ts.memoryRss) : '-';
-  document.getElementById('versionVal').textContent = ts.version || '-';
+function updateSummary() {
+  if (!summaryData) return;
+  var s = summaryData;
 
-  var dex = m.dex || {};
+  // 总盈亏
+  var tv = document.getElementById('sTotalPnl');
+  var tvNum = s.totalPnlInclUnrealized || 0;
+  tv.textContent = (tvNum >= 0 ? '+' : '') + tvNum.toFixed(2);
+  tv.style.color = tvNum >= 0 ? 'var(--green)' : 'var(--red)';
+  document.getElementById('sRealizedPnl').textContent = (s.totalPnl >= 0 ? '+' : '') + s.totalPnl.toFixed(2);
+  document.getElementById('sUnrealizedPnl').textContent = (s.unrealizedPnl >= 0 ? '+' : '') + s.unrealizedPnl.toFixed(2);
+
+  // 今日
+  var td = document.getElementById('sTodayPnl');
+  var tdNum = s.todayPnl || 0;
+  td.textContent = (tdNum >= 0 ? '+' : '') + tdNum.toFixed(2);
+  td.style.color = tdNum >= 0 ? 'var(--green)' : 'var(--red)';
+  document.getElementById('sTodayTrades').textContent = s.todayTrades || 0;
+  document.getElementById('sWinRate').textContent = (s.winRate || 0) + '%';
+
+  // 持仓
+  document.getElementById('sOpenPositions').textContent = s.openPositions || 0;
+  document.getElementById('sBalance').textContent = s.balance ? fmtNum(s.balance) : '-';
+  document.getElementById('sTotalTrades').textContent = s.totalTrades || 0;
+
+  // 系统
+  var dot = document.getElementById('sStatusDot');
+  var st = document.getElementById('sStatusText');
+  dot.className = s.pyOnline ? 'dot dot-green' : 'dot dot-red';
+  st.textContent = s.pyOnline ? 'AI在线' : 'AI离线';
+
+  var rs = document.getElementById('sRiskStatus');
+  rs.textContent = s.marginStatus === 'critical' ? '⚠️ 危险' : s.marginStatus === 'warning' ? '⚠️ 警告' : '正常';
+  rs.style.color = s.marginStatus === 'critical' ? 'var(--red)' : s.marginStatus === 'warning' ? 'var(--yellow)' : 'var(--green)';
+
+  document.getElementById('sUptime').textContent = s.uptime ? formatUptime(s.uptime) : '-';
+  document.getElementById('versionVal').textContent = s.version || '-';
+
+  // 模式标识
   var badgeEl = document.getElementById('modeBadge');
-  if (dex.paperTrading) {
+  if (s.balance > 0 && s.balance < 50000) {
     badgeEl.innerHTML = '<span class="badge badge-paper">PAPER</span>';
   } else {
     badgeEl.innerHTML = '<span class="badge badge-live">LIVE</span>';
   }
-
-  var py = m.pythonAi || {};
-  var pyDot = document.getElementById('mPyDot');
-  var pyStatus = py.status || 'offline';
-  if (pyStatus === 'online') {
-    pyDot.className = 'dot dot-green';
-    document.getElementById('mPyStatus').innerHTML = '<span class="dot dot-green"></span> \u5728\u7ebf';
-  } else if (pyStatus === 'warning') {
-    pyDot.className = 'dot dot-yellow';
-    document.getElementById('mPyStatus').innerHTML = '<span class="dot dot-yellow"></span> \u8b66\u544a';
-  } else {
-    pyDot.className = 'dot dot-red';
-    document.getElementById('mPyStatus').innerHTML = '<span class="dot dot-red"></span> \u79bb\u7ebf';
-  }
-  document.getElementById('mPyPing').textContent = (py.lastPingAge !== null && py.lastPingAge !== undefined) ? timeAgo(Date.now() - py.lastPingAge * 1000) : 'N/A';
-  document.getElementById('mPySymbols').textContent = (py.symbols && py.symbols.length > 0) ? py.symbols.length + ' \u4e2a' : '-';
-  document.getElementById('mPyConfig').textContent = '\u9608\u503c ' + (py.confidenceThreshold || '-') + '%';
-
-  var mkt = m.marketData || {};
-  var mktDot = document.getElementById('mMktDot');
-  var mktConnected = mkt.status === 'connected';
-  mktDot.className = mktConnected ? 'dot dot-green' : 'dot dot-red';
-  document.getElementById('mMktStatus').textContent = mktConnected ? '\u5df2\u8fde\u63a5' : '\u5df2\u65ad\u5f00';
-  document.getElementById('mMktSymbols').textContent = (mkt.symbols && mkt.symbols.length > 0) ? mkt.symbols.length + ' \u4e2a' : '-';
-
-  document.getElementById('mDexProvider').textContent = dex.provider || '-';
-  document.getElementById('mDexMode').textContent = dex.paperTrading ? '\u6a21\u62df\u76d8' : '\u5b9e\u76d8';
-  document.getElementById('mDexAccount').textContent = dex.accountIndex || '-';
-
-  var risk = m.riskEngine || {};
-  var riskDot = document.getElementById('mRiskDot');
-  var riskStatus = risk.status || 'normal';
-  if (riskStatus === 'normal') {
-    riskDot.className = 'dot dot-green';
-    document.getElementById('mRiskStatus').innerHTML = '<span class="dot dot-green"></span> \u6b63\u5e38';
-  } else if (riskStatus === 'warning') {
-    riskDot.className = 'dot dot-yellow';
-    document.getElementById('mRiskStatus').innerHTML = '<span class="dot dot-yellow"></span> \u8b66\u544a';
-  } else {
-    riskDot.className = 'dot dot-red';
-    document.getElementById('mRiskStatus').innerHTML = '<span class="dot dot-red"></span> \u5371\u9669';
-  }
-  var loss = risk.dailyLoss || 0;
-  var lossEl = document.getElementById('mRiskLoss');
-  lossEl.textContent = '$' + fmt(loss, 2);
-  lossEl.style.color = loss > (risk.dailyLossLimit || 20) ? 'var(--red)' : 'var(--text)';
-  document.getElementById('mRiskLimit').textContent = '$' + (risk.dailyLossLimit || 20);
-  var mr = risk.marginRatio || 0;
-  document.getElementById('mRiskMargin').textContent = fmt(mr * 100, 1) + '%';
-  document.getElementById('mRiskSltp').textContent = risk.activeSLTP || 0;
 }
 
 function updateSymbolFilter(symbols) {
@@ -813,13 +856,14 @@ function fetchPositionsAndTrades() {
     var tbody = document.getElementById('positionsBody');
     document.getElementById('posCount').textContent = '(' + pos.length + ')';
     if (pos.length === 0) {
-      tbody.innerHTML = '<tr><td colspan="5" class="empty-state">暂无持仓</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="6" class="empty-state">暂无持仓</td></tr>';
     } else {
       tbody.innerHTML = '';
       for (var i = 0; i < pos.length; i++) {
         var p = pos[i];
         var tr = document.createElement('tr');
-        tr.innerHTML = '<td>' + p.symbol + '</td><td class="pos-' + p.side + '">' + p.side + '</td><td>' + p.size + '</td><td>' + fmtNum(p.entryPrice) + '</td><td>' + (p.unrealizedPnl ? fmt(p.unrealizedPnl, 4) : '0') + '</td>';
+        var pnlCls = p.realizedPnl >= 0 ? 'pos-long' : 'pos-short';
+        tr.innerHTML = '<td>' + p.symbol + '</td><td class="pos-' + p.side + '">' + p.side + '</td><td>' + p.size + '</td><td>' + fmtNum(p.entryPrice) + '</td><td>' + (p.unrealizedPnl ? fmt(p.unrealizedPnl, 4) : '0') + '</td><td class="' + pnlCls + '">' + fmt(p.realizedPnl, 4) + '</td>';
         tbody.appendChild(tr);
       }
     }
@@ -829,14 +873,15 @@ function fetchPositionsAndTrades() {
     var tbody = document.getElementById('tradesBody');
     document.getElementById('tradeCount').textContent = '(' + trades.length + ')';
     if (trades.length === 0) {
-      tbody.innerHTML = '<tr><td colspan="6" class="empty-state">暂无交易</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="6" class="empty-state">暂无交易记录</td></tr>';
     } else {
       tbody.innerHTML = '';
       for (var i = 0; i < trades.length; i++) {
         var t = trades[i];
         var tr = document.createElement('tr');
-        var statusCls = t.status === 'filled' ? 'trade-filled' : t.status === 'cancelled' ? 'trade-cancelled' : 'trade-rejected';
-        tr.innerHTML = '<td>' + timeAgo(t.createdAt) + '</td><td>' + t.symbol + '</td><td>' + t.side + '</td><td>' + t.size + '</td><td>' + fmtNum(t.limitPrice) + '</td><td class="' + statusCls + '">' + t.status + '</td>';
+        var pnlVal = parseFloat(t.pnl || '0');
+        var pnlCls = pnlVal >= 0 ? 'pos-long' : 'pos-short';
+        tr.innerHTML = '<td>' + timeAgo(t.timestamp) + '</td><td>' + t.symbol + '</td><td>' + t.side + '</td><td>' + t.size + '</td><td>' + fmtNum(parseFloat(t.price)) + '</td><td class="' + pnlCls + '">' + fmt(pnlVal, 4) + '</td>';
         tbody.appendChild(tr);
       }
     }
@@ -882,14 +927,14 @@ function setupFilters() {
 document.addEventListener('DOMContentLoaded', function() {
   setupFilters();
   Promise.all([
-    fetch('/api/modules').then(function(r) { return r.json(); }),
+    fetch('/api/summary').then(function(r) { return r.json(); }),
     fetch('/api/ai').then(function(r) { return r.json(); })
   ]).then(function(results) {
-    modulesData = results[0];
+    summaryData = results[0];
     aiData = results[1];
     lastRefresh = Date.now();
-    updateModules();
-    updateSymbolFilter(modulesData.pythonAi ? modulesData.pythonAi.symbols : null);
+    updateSummary();
+    updateSymbolFilter(null);
     renderAI();
     fetchPositionsAndTrades();
     updateFooter();
@@ -907,11 +952,11 @@ evtSource.onerror = function() {
     connStatus.className = 'conn-status conn-disconnected';
   }
 };
-evtSource.addEventListener('modules', function(e) {
-  try { modulesData = JSON.parse(e.data); } catch (err) { console.error('Invalid modules event data', err); return; }
+evtSource.addEventListener('summary', function(e) {
+  try { summaryData = JSON.parse(e.data); } catch (err) { console.error('Invalid summary event data', err); return; }
   lastRefresh = Date.now();
-  updateModules();
-  updateSymbolFilter(modulesData.pythonAi ? modulesData.pythonAi.symbols : null);
+  updateSummary();
+  updateSymbolFilter(null);
   updateFooter();
   updateRefreshAgo();
   if (connStatus) {

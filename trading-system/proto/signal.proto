@@ -23,10 +23,20 @@ message TradingSignal {
   string order_type = 12;       // "limit" 或 "market"
 }
 
+message PositionInfo {
+  string symbol = 1;
+  string side = 2;      // "long", "short", ""
+  double size = 3;
+  double entry_price = 4;
+  double unrealized_pnl = 5;
+  double realized_pnl = 6;
+}
+
 message SignalAck {
   string signal_id = 1;
   bool accepted = 2;
   string reason = 3;
+  PositionInfo position = 4;   // 当前币种的持仓信息（如果有）
 }
 
 message HealthRequest {}

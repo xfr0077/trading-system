@@ -11,9 +11,20 @@ from proto import signal_pb2_grpc
 
 
 @dataclass
+class PositionInfo:
+    symbol: str = ""
+    side: str = ""       # "long", "short", ""
+    size: float = 0.0
+    entry_price: float = 0.0
+    unrealized_pnl: float = 0.0
+    realized_pnl: float = 0.0
+
+
+@dataclass
 class SignalAck:
     accepted: bool
     reason: str
+    position: Optional[PositionInfo] = None
 
 
 class SignalError(Exception):
@@ -50,9 +61,9 @@ class SignalClient:
                     with open(tls_ca_path, 'rb') as f:
                         ca_cert = f.read()
                 credentials = grpc.ssl_channel_credentials(root_certificates=ca_cert)
-                self.channel = grpc.secure_channel(target, credentials, options=options)
+                self.channel = grpc.aio.secure_channel(target, credentials, options=options)
             else:
-                self.channel = grpc.insecure_channel(target, options=options)
+                self.channel = grpc.aio.insecure_channel(target, options=options)
             self.stub = signal_pb2_grpc.SignalServiceStub(self.channel)
 
     def _validate_signal(
@@ -80,7 +91,7 @@ class SignalClient:
         if signal_price <= 0:
             raise ValueError(f"signal_price must be positive, got {signal_price}")
 
-    def send_signal(
+    async def send_signal(
         self,
         symbol: str,
         action: str,
@@ -111,8 +122,17 @@ class SignalClient:
         )
 
         try:
-            response = self.stub.SendSignal(request, timeout=self._RPC_TIMEOUT)
-            return SignalAck(accepted=response.accepted, reason=response.reason)
+            response = await self.stub.SendSignal(request, timeout=self._RPC_TIMEOUT)
+            # 解析服务端返回的仓位信息
+            pos_info = None
+            if response.HasField('position'):
+                p = response.position
+                pos_info = PositionInfo(
+                    symbol=p.symbol, side=p.side, size=p.size,
+                    entry_price=p.entry_price, unrealized_pnl=p.unrealized_pnl,
+                    realized_pnl=p.realized_pnl,
+                )
+            return SignalAck(accepted=response.accepted, reason=response.reason, position=pos_info)
         except grpc.RpcError as e:
             status_code = e.code()
             details = e.details() if hasattr(e, "details") else str(e)
@@ -125,30 +145,23 @@ class SignalClient:
             else:
                 raise SignalError(f"gRPC error ({status_code}): {details}") from e
 
-    def health_check(self) -> bool:
+    async def health_check(self) -> bool:
         try:
-            response = self.stub.HealthCheck(signal_pb2.HealthRequest(), timeout=self._RPC_TIMEOUT)
+            response = await self.stub.HealthCheck(signal_pb2.HealthRequest(), timeout=self._RPC_TIMEOUT)
             return response.healthy
         except grpc.RpcError:
             return False
         except Exception:
             return False
 
-    def close(self) -> None:
+    async def close(self) -> None:
         if self._owns_channel and self.channel is not None:
-            self.channel.close()
+            await self.channel.close()
             self.channel = None
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.close()
-        return False
 
     async def __aenter__(self):
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        self.close()
+        await self.close()
         return False

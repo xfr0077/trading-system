@@ -65,8 +65,8 @@ async function deploy() {
     });
     console.log('[Deploy] Upload done');
 
-    // Extract and deploy
-    await execSSH(conn, 'mkdir -p /opt/trading-system && cd /opt/trading-system && tar xzf deploy.tar.gz && rm deploy.tar.gz');
+    // Extract and deploy (clean old src to avoid stale files)
+    await execSSH(conn, 'mkdir -p /opt/trading-system && cd /opt/trading-system && rm -rf ts-engine/src proto && tar xzf deploy.tar.gz && rm deploy.tar.gz');
     console.log('[Deploy] Extracted');
 
     // Check docker

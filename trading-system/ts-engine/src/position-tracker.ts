@@ -50,14 +50,23 @@ export class PositionTracker {
     return p !== undefined && p.size > 0;
   }
 
-  onOrderFilled(symbol: string, side: 'buy' | 'sell', size: number, fillPrice: number): void {
+  onOrderFilled(symbol: string, side: 'buy' | 'sell', size: number, fillPrice: number): number {
     const existing = this.positions.get(symbol);
+    let fillPnl = 0;
     if (existing) {
       if (existing.side === (side === 'buy' ? 'long' : 'short')) {
+        // Same direction: average entry price
         const totalSize = existing.size + size;
         existing.entryPrice = (existing.entryPrice * existing.size + fillPrice * size) / totalSize;
         existing.size = totalSize;
       } else {
+        // Opposite direction: reduce or close — calculate realized PnL
+        const closeSize = Math.min(size, existing.size);
+        fillPnl = existing.side === 'long'
+          ? (fillPrice - existing.entryPrice) * closeSize
+          : (existing.entryPrice - fillPrice) * closeSize;
+        existing.realizedPnl += fillPnl;
+
         if (size >= existing.size) {
           this.positions.delete(symbol);
         } else {
@@ -76,6 +85,7 @@ export class PositionTracker {
         updatedAt: Date.now(),
       });
     }
+    return fillPnl;
   }
 
   onOrderCancelled(symbol: string, side: 'buy' | 'sell', size: number): void {
@@ -102,17 +112,20 @@ export class PositionTracker {
     if (rawPositions.length === 0) {
       console.log('[PositionTracker] DEX returned empty positions, preserving local tracking');
     } else {
+      // 合并 DEX 仓位数据，保留本地累加的 realizedPnl（避免 sync 覆盖刚成交的盈亏）
+      const oldPositions = new Map(this.positions);
       this.positions.clear();
       for (const p of rawPositions) {
         const size = Math.abs(parseFloat(p.size || '0'));
         if (size > 0) {
+          const oldPos = oldPositions.get(p.symbol);
           this.positions.set(p.symbol, {
             symbol: p.symbol,
-            side: p.side && p.side !== 'none' ? p.side : (parseFloat(p.size) < 0 ? 'short' : 'long'),
+            side: p.side && (p.side as string) !== 'none' ? p.side : (parseFloat(p.size) < 0 ? 'short' : 'long'),
             size,
             entryPrice: parseFloat(p.entryPrice || '0'),
             unrealizedPnl: parseFloat(p.unrealizedPnl || '0'),
-            realizedPnl: parseFloat(p.realizedPnl || '0'),
+            realizedPnl: oldPos ? oldPos.realizedPnl : parseFloat(p.realizedPnl || '0'),
             updatedAt: p.updatedAt || Date.now(),
           });
         }
