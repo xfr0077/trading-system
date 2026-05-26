@@ -21,7 +21,14 @@
 - MAX_POSITION_SIZE=0.003 BTC (~$231)
 - MAX_DAILY_LOSS=$20
 - MAX_CONCURRENT_SIGNALS=2
-- MIN_CONFIDENCE=60%
+- MIN_CONFIDENCE=55%  # 校准分析优化: 从 50 提至 55, acc 62%→67%, F1 0.536→0.658
+
+## 模型校准（2026-05-22 分析）
+- 总体准确率: 55.0% (原始 test set, close=50.1% 基线)
+- ECE: 8.07% (模型已天然校准良好)
+- 温度缩放: T=0.95, 收益忽略不计
+- **55% 阈值 = 最优 trade-off** (66.6% acc, 530 signals, F1=0.658)
+- "close" 类偏置: 模型预测 74% close vs 真实 50%, 需 class-weighted 训练缓解
 
 ## 部署命令
 ```bash

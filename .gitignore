@@ -36,3 +36,5 @@ Thumbs.db
 # Training artifacts (not needed in repo)
 *.pkl
 training_data.pkl
+*.onnx
+model_state.pt
