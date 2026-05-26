@@ -1,17 +1,36 @@
-import pytest
+import asyncio
 import subprocess
 import time
 import grpc
 import os
 import sys
 
+import pytest
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'python-ai', 'src'))
 
 from signal_client import SignalClient
 
 
+# Windows compat: gRPC aio needs a selector event loop
+if os.name == 'nt':
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+
 @pytest.fixture(scope='session')
-def grpc_server():
+def event_loop():
+    """Override pytest-asyncio's default event loop to be session-scoped."""
+    if os.name == 'nt':
+        loop = asyncio.SelectorEventLoop()
+    else:
+        loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    yield loop
+    loop.close()
+
+
+@pytest.fixture(scope='session')
+async def grpc_server():
     ts_engine_dir = os.path.join(os.path.dirname(__file__), '..', '..', 'ts-engine')
     env = {
         **os.environ,
@@ -38,7 +57,7 @@ def grpc_server():
             channel.close()
             break
         except grpc.RpcError:
-            time.sleep(0.5)
+            await asyncio.sleep(0.5)
     else:
         proc.terminate()
         proc.wait()
@@ -55,6 +74,6 @@ def grpc_server():
 
 
 @pytest.fixture
-def client(grpc_server):
-    with SignalClient(target=grpc_server) as c:
-        yield c
+async def client(grpc_server):
+    c = SignalClient(target=grpc_server)
+    yield c

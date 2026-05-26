@@ -1,4 +1,4 @@
-services:
+﻿services:
   ts-engine:
     build:
       context: .
@@ -7,8 +7,6 @@ services:
       - "50051:50051"
       - "80:80"
     environment:
-      - PRIVATE_KEY=${PRIVATE_KEY}
-      - GRVT_ENV=${GRVT_ENV:-testnet}
       - DEX=${DEX:-lighter}
       - DEX_ENV=${DEX_ENV:-mainnet}
       - REDIS_URL=redis://redis:6379
@@ -67,13 +65,15 @@ services:
       - REDIS_URL=redis://redis:6379
       - TS_ENGINE_GRPC_URL=ts-engine:50051
       - MODEL_PATH=/app/models/model.onnx
-      - CONFIDENCE_THRESHOLD=50
-      - FEATURE_WINDOW=60
+      - CONFIDENCE_THRESHOLD=55
+      - FEATURE_WINDOW=100
+      - SYMBOLS=${SYMBOLS:-BTC_USDT_Perp,ETH_USDT_Perp}
       - STOP_LOSS_PCT=${STOP_LOSS_PCT:-0.98}
       - TAKE_PROFIT_PCT=${TAKE_PROFIT_PCT:-1.02}
       - MAX_SLIPPAGE_BPS=10
       - POSITION_SIZE=${MAX_POSITION_SIZE:-0.1}
       - USE_LEGACY_FEATURES=false
+      - INFERENCE_INTERVAL_SECONDS=30
     depends_on:
       redis:
         condition: service_healthy
