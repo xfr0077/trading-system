@@ -1,3 +1,6 @@
+# temp
+tmp/
+*.db
 # Python
 __pycache__/
 *.py[cod]
