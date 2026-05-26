@@ -16,6 +16,8 @@ class ModelInference:
         # features: (batch, features) -> reshape to (batch, 1, features) for LSTM
         if features.ndim == 2:
             features = features[:, np.newaxis, :]
+        if features.shape[0] == 0:
+            return None, 0.0
         result = self.session.run(None, {self._input_name: features.astype(np.float32)})
         if isinstance(result[0], dict):
             action_idx = int(result[0]['action'][0])

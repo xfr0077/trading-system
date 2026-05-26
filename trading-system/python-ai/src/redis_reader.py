@@ -71,12 +71,12 @@ class RedisMarketReader:
                         self._last_ids[symbol] = msg_id.decode()
                         yield data
 
-            except aioredis.ConnectionError:
+            except (aioredis.ConnectionError, aioredis.TimeoutError, aioredis.ResponseError) as redis_err:
                 # 断线后重连，指数退避
                 self._reconnect_attempt += 1
                 delay = min(self._BASE_RECONNECT_DELAY * (2 ** (self._reconnect_attempt - 1)), self._MAX_RECONNECT_DELAY)
                 logger = __import__('logging').getLogger(__name__)
-                logger.warning(f"[RedisReader] Connection lost, retrying in {delay:.1f}s (attempt {self._reconnect_attempt})")
+                logger.warning(f"[RedisReader] {type(redis_err).__name__}, retrying in {delay:.1f}s (attempt {self._reconnect_attempt})")
                 await asyncio.sleep(delay)
                 for symbol in self._symbols:
                     self._last_ids[symbol] = "$"
