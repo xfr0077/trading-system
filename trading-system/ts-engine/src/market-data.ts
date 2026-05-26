@@ -20,6 +20,7 @@ export class MarketDataStream {
   private latestPrices = new Map<string, MarketData>();
   private pollingInterval: NodeJS.Timeout | null = null;
   private priceCallbacks: Array<(data: MarketData) => void> = [];
+  private _lastSuccessfulPoll: number = 0;
   private dexAdapter: IDexAdapter | null = null;
 
   constructor(config: MarketDataConfig, redis: Redis, dexAdapter?: IDexAdapter) {
@@ -50,6 +51,7 @@ export class MarketDataStream {
         console.error(`[MarketData] Poll failed for ${symbol}:`, err);
       }
     }
+    this._lastSuccessfulPoll = Date.now();
   }
 
   private async fetchLighterPrice(symbol: string): Promise<MarketData | null> {
@@ -99,6 +101,11 @@ export class MarketDataStream {
 
   getLatestPriceInMemory(symbol: string): MarketData | null {
     return this.latestPrices.get(symbol) || null;
+  }
+
+  public getConnectionStatus(): string {
+    const elapsed = Date.now() - this._lastSuccessfulPoll;
+    return elapsed < 15000 ? 'connected' : 'disconnected';
   }
 
   async disconnect(): Promise<void> {

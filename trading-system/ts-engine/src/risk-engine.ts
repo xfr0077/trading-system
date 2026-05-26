@@ -145,7 +145,8 @@ export class RiskEngine {
         const atr = trueRanges.reduce((s, r) => s + r, 0) / trueRanges.length;
         // P2: Update volatility regime based on ATR
         this.updateVolRegime(signal.symbol, atr / currentPrice);
-        return atr;
+        // Ensure minimum ATR to prevent SL/TP = entry price
+        return Math.max(atr, currentPrice * 0.005);
       }
     }
     // Fallback: 2% of price
@@ -180,17 +181,33 @@ export class RiskEngine {
     const regimeMultiplier = this.volRegime === 'high' ? 1.5 : this.volRegime === 'low' ? 1.0 : 1.0;
     const atrMultiplier = this.config.atrMultiplier * regimeMultiplier;
 
+    let stopLoss: number;
+    let takeProfit: number;
     if (signal.action === 'long') {
-      const stopLoss = currentPrice - (atr * atrMultiplier);
+      stopLoss = currentPrice - (atr * atrMultiplier);
       const risk = currentPrice - stopLoss;
-      const takeProfit = currentPrice + (risk * this.config.minRiskRewardRatio);
-      return { stopLoss, takeProfit };
+      takeProfit = currentPrice + (risk * this.config.minRiskRewardRatio);
     } else {
-      const stopLoss = currentPrice + (atr * atrMultiplier);
+      stopLoss = currentPrice + (atr * atrMultiplier);
       const risk = stopLoss - currentPrice;
-      const takeProfit = currentPrice - (risk * this.config.minRiskRewardRatio);
-      return { stopLoss, takeProfit };
+      takeProfit = currentPrice - (risk * this.config.minRiskRewardRatio);
     }
+
+    // Safety guard: ensure minimum SL/TP distance (0.5% of entry)
+    const minDist = currentPrice * 0.005;
+    if (signal.action === 'long') {
+      if (currentPrice - stopLoss < minDist) stopLoss = currentPrice - minDist;
+      if (takeProfit - currentPrice < minDist * this.config.minRiskRewardRatio) {
+        takeProfit = currentPrice + minDist * this.config.minRiskRewardRatio;
+      }
+    } else {
+      if (stopLoss - currentPrice < minDist) stopLoss = currentPrice + minDist;
+      if (currentPrice - takeProfit < minDist * this.config.minRiskRewardRatio) {
+        takeProfit = currentPrice - minDist * this.config.minRiskRewardRatio;
+      }
+    }
+
+    return { stopLoss, takeProfit };
   }
 
   async check(input: RiskCheckInput): Promise<RiskCheckResult> {

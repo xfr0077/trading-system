@@ -4,12 +4,12 @@ import { MarketDataStream } from '../src/market-data';
 
 function createMockConfig(overrides = {}): Config {
   return {
-    privateKey: '0xtest-secret',
     env: 'testnet',
-    dexProvider: 'lighter',
+    dexProvider: 'lighter' as const,
     redisUrl: 'redis://localhost:6379',
     sqlitePath: 'C:\\Users\\Administrator\\AppData\\Local\\Temp\\test-signal-router.db',
     grpcPort: 0,
+    grpcTlsEnabled: false,
     dashboardPort: 3000,
     tailscaleAiIp: '127.0.0.1',
     symbols: ['BTC_USDT_Perp', 'ETH_USDT_Perp'],
@@ -21,6 +21,10 @@ function createMockConfig(overrides = {}): Config {
     signalTtlMs: 30000,
     marginWarningThreshold: 0.7,
     marginCriticalThreshold: 0.9,
+    trailingStopPct: 0.01,
+    paperTrading: true,
+    corsOrigins: ['*'],
+    rateLimitRpm: 60,
     ...overrides,
   };
 }
@@ -35,6 +39,8 @@ function createMockMarketData(): MarketDataStream {
       volume24h: 1000,
       timestamp: Date.now(),
     })),
+    onPriceUpdate: jest.fn(),
+    disconnect: jest.fn(),
   } as unknown as MarketDataStream;
   return mockStream;
 }
@@ -58,7 +64,7 @@ describe('SignalRouter', () => {
       signalId: 'uuid-1',
       symbol: 'BTC_USDT_Perp',
       action: 'long',
-      stopLoss: 97000,
+      stopLoss: 98300,   // risk=200, reward=1500, ratio=7.5 (>= minRiskRewardRatio=2)
       takeProfit: 100000,
       confidence: 75,
       positionSize: 0.01,
@@ -155,7 +161,7 @@ describe('SignalRouter', () => {
       // 第二个信号用不同 symbol，避免 PENDING_ORDER_EXISTS
       const ack2 = await router.handleSignal(createValidSignal({
         signalId: 'action-short', action: 'short', symbol: 'ETH_USDT_Perp',
-        stopLoss: 100000, takeProfit: 97000, signalPrice: 98500,
+        stopLoss: 100000, takeProfit: 95000, signalPrice: 98500,
       }));
       expect(ack2.accepted).toBe(true);
     });
@@ -264,19 +270,27 @@ describe('SignalRouter', () => {
       server.forceShutdown();
     });
 
-    test('should reject when port is already in use', async () => {
-      const fixedPort = 19999;
+    // Skipped on Windows: gRPC's SO_REUSEADDR allows binding to the same port
+    // as a net.Server, making EADDRINUSE unreproducible.
+    const isWindows = process.platform === 'win32';
+    const testOrSkip = isWindows ? test.skip : test;
+    testOrSkip('should reject when port is already in use', async () => {
+      const net = require('net');
+      // Occupy a random port with a TCP server to force EADDRINUSE
+      const tempServer = net.createServer();
+      await new Promise<void>((resolve, reject) => {
+        tempServer.on('error', reject);
+        tempServer.listen(0, resolve);
+      });
+      const addr = tempServer.address();
+      const occupiedPort = typeof addr === 'object' && addr ? addr.port : 0;
+
       const router2 = new SignalRouter(createMockConfig());
       router2.setMarketData(createMockMarketData());
-      const server1 = await router2.startServer(fixedPort);
+      await expect(router2.startServer(occupiedPort)).rejects.toThrow();
 
-      const router3 = new SignalRouter(createMockConfig());
-      router3.setMarketData(createMockMarketData());
-      await expect(router3.startServer(fixedPort)).rejects.toThrow();
-
-      server1.forceShutdown();
+      tempServer.close();
       router2.stop();
-      router3.stop();
     });
   });
 });

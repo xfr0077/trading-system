@@ -5,7 +5,7 @@ function createDefaultSignal(): TradingSignal {
     signalId: 'test-1',
     symbol: 'BTC_USDT_Perp',
     action: 'long',
-    stopLoss: 97000,
+    stopLoss: 98300,   // risk=200, reward=1500, ratio=7.5 (>= minRiskRewardRatio=2)
     takeProfit: 100000,
     confidence: 75,
     positionSize: 0.05,
@@ -49,6 +49,15 @@ describe('RiskEngine', () => {
       maxPriceDeviationPct: 0.5,
       signalTtlMs: 30000,
       requireMarginOk: true,
+      maxPortfolioExposure: 0.5,
+      maxCorrelatedExposure: 0.3,
+      maxLeverage: 3,
+      kellyFraction: 0.25,
+      atrMultiplier: 2,
+      minRiskRewardRatio: 2,
+      maxDrawdownPct: 0.15,
+      trailingStopPct: 0.02,
+      scaleInLevels: 3,
     });
   });
 
@@ -58,13 +67,13 @@ describe('RiskEngine', () => {
     expect(result.allowed).toBe(true);
   });
 
-  test('should reject if position size exceeds limit', async () => {
+  test('should reject if total exposure exceeds limit', async () => {
     const input = createDefaultInput({
-      signal: { ...createDefaultSignal(), positionSize: 0.15 },
+      signal: { ...createDefaultSignal(), positionSize: 0.4 }, // exceeds maxPositionSize * maxConcurrentSignals = 0.3
     });
     const result = await engine.check(input);
     expect(result.allowed).toBe(false);
-    expect(result.reason).toBe('POSITION_SIZE_EXCEEDED');
+    expect(result.reason).toBe('CONCURRENT_SIGNALS_EXCEEDED');
   });
 
   test('should reject if confidence too low', async () => {

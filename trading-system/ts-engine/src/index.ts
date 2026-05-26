@@ -8,13 +8,16 @@ dotenv.config();
 // Polyfill WebSocket for Node 20
 if (typeof globalThis.WebSocket === 'undefined') {
   const { WebSocket } = require('ws');
-  (globalThis as any).WebSocket = WebSocket;
+  (globalThis as { WebSocket: typeof WebSocket }).WebSocket = WebSocket;
 }
 
 async function main() {
   const config = loadConfig();
   const router = new SignalRouter(config);
   const redis = new Redis(config.redisUrl);
+  redis.on('error', (err) => {
+    console.error('[Redis] Connection error (non-fatal):', err.message);
+  });
 
   try {
     await router.initializeMarketData(redis);
@@ -46,12 +49,19 @@ async function main() {
     }
   })();
 
+  process.on('unhandledRejection', (reason, promise) => {
+    console.error('[Main] Unhandled Rejection at:', promise, 'reason:', reason);
+  });
+  process.on('uncaughtException', (err) => {
+    console.error('[Main] Uncaught Exception:', err.message);
+    console.error(err.stack);
+  });
+
   process.on('SIGTERM', () => {
     console.log('SIGTERM received, shutting down...');
     router.stop();
     redis.disconnect();
     server.forceShutdown();
-    process.exit(0);
   });
 
   process.on('SIGINT', () => {
@@ -59,7 +69,6 @@ async function main() {
     router.stop();
     redis.disconnect();
     server.forceShutdown();
-    process.exit(0);
   });
 }
 

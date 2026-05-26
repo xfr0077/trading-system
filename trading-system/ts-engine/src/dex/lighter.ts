@@ -347,7 +347,13 @@ export class LighterAdapter implements IDexAdapter {
         reject: (err: Error) => { this.recordFailure(action, err.message); reject(err); },
         timer,
       });
-      this.proc.stdin.write(JSON.stringify({ id, action, params }) + '\n');
+      try {
+        this.proc.stdin.write(JSON.stringify({ id, action, params }) + '\n');
+      } catch (err) {
+        this.pending.delete(id);
+        clearTimeout(timer);
+        return reject(new DexError(`Failed to send: ${(err as Error).message}`, DexErrorCode.CONNECTION_LOST, false));
+      }
     });
   }
 
