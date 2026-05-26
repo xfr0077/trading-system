@@ -91,12 +91,13 @@ trading-system/
 ├── ts-engine/                      # VPS 端 TypeScript 交易引擎
 │   ├── src/
 │   │   ├── index.ts                # 入口文件
-│   │   ├── config.ts               # 配置管理（环境变量校验）
+│   │   ├── config.ts               # 配置管理（zod schema 校验）
 │   │   ├── signal-router.ts        # gRPC Server（信号去重、验证、风控集成）
 │   │   ├── risk-engine.ts          # 风控引擎（TTL/置信度/仓位/滑点/保证金/Shadow Position）
 │   │   ├── margin-monitor.ts       # 保证金监控（阈值预警、状态回调）
-│   │   ├── order-manager.ts        # 订单管理器（状态机、部分成交）
-│   │   └── market-data.ts          # Hyperliquid REST 轮询 + Redis 写入
+│   │   ├── order-manager.ts        # 订单管理器（xstate 状态机）
+│   │   ├── market-data.ts          # 行情数据流 + Redis 写入
+│   │   └── dashboard.ts            # HTTP Dashboard（hono 路由）
 │   ├── tests/                      # 单元测试
 │   ├── proto/                      # 生成的 gRPC TypeScript 代码
 │   ├── package.json
@@ -108,7 +109,7 @@ trading-system/
 │   │   ├── main.py                 # AI 服务主循环
 │   │   ├── config.py               # Pydantic 配置管理
 │   │   ├── redis_reader.py         # Redis Streams 消费者（跳尾机制）
-│   │   ├── feature_engine.py       # 特征工程（MA/RSI/MACD/布林带）
+│   │   ├── feature_engine.py       # 特征工程（ta 库: MA/RSI/MACD/布林带）
 │   │   ├── model_inference.py      # ONNX CPU 推理
 │   │   ├── signal_client.py        # gRPC Client（发送信号到 TS Engine）
 │   │   └── proto/                  # 生成的 gRPC Python 代码

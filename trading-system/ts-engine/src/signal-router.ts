@@ -972,7 +972,8 @@ export class SignalRouter {
       return;
     }
 
-    this.orderManager.updateStatus(order.clientOrderId, update.status, update.orderId, parseFloat(update.fee));
+    const updatedOrder = this.orderManager.updateStatus(order.clientOrderId, update.status, update.orderId, parseFloat(update.fee));
+    if (!updatedOrder) return;
 
     // 更新 Shadow Position 和持久化
     if (update.status === 'filled') {
@@ -1041,27 +1042,24 @@ export class SignalRouter {
       this.positionTracker.removeOpenOrder(order.clientOrderId);
     }
 
-    // 更新并保存订单
-    order.orderId = update.orderId;
-    order.status = update.status;
-    order.updatedAt = Date.now();
+    // 更新并保存订单 (use fresh snapshot from xstate)
     this.sqliteStore.saveOrder({
-      clientOrderId: order.clientOrderId,
-      orderId: order.orderId,
-      signalId: order.signalId,
-      symbol: order.symbol,
-      side: order.side,
-      size: String(order.size),
-      remainingSize: String(order.remainingSize),
-      limitPrice: String(order.limitPrice),
-      stopLoss: String(order.stopLoss || 0),
-      takeProfit: String(order.takeProfit || 0),
-      status: order.status,
-      orderType: order.orderType || 'market',
+      clientOrderId: updatedOrder.clientOrderId,
+      orderId: updatedOrder.orderId,
+      signalId: updatedOrder.signalId,
+      symbol: updatedOrder.symbol,
+      side: updatedOrder.side,
+      size: String(updatedOrder.size),
+      remainingSize: String(updatedOrder.remainingSize),
+      limitPrice: String(updatedOrder.limitPrice),
+      stopLoss: String(updatedOrder.stopLoss || 0),
+      takeProfit: String(updatedOrder.takeProfit || 0),
+      status: updatedOrder.status,
+      orderType: updatedOrder.orderType || 'market',
       fee: update.fee,
-      createdAt: order.createdAt,
-      updatedAt: Date.now(),
-      expiresAt: order.createdAt + this.config.signalTtlMs,
+      createdAt: updatedOrder.createdAt,
+      updatedAt: updatedOrder.updatedAt,
+      expiresAt: updatedOrder.createdAt + this.config.signalTtlMs,
     });
   }
 

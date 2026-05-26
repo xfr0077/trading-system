@@ -8,6 +8,8 @@ describe('SqliteStore', () => {
 
   beforeEach(async () => {
     if (fs.existsSync(dbPath)) fs.unlinkSync(dbPath);
+    try { if (fs.existsSync(dbPath + '-wal')) fs.unlinkSync(dbPath + '-wal'); } catch {}
+    try { if (fs.existsSync(dbPath + '-shm')) fs.unlinkSync(dbPath + '-shm'); } catch {}
     store = new SqliteStore(dbPath);
     await store.waitReady();
   });
@@ -15,6 +17,9 @@ describe('SqliteStore', () => {
   afterEach(() => {
     store.close();
     if (fs.existsSync(dbPath)) fs.unlinkSync(dbPath);
+    // Clean up WAL auxiliary files
+    try { if (fs.existsSync(dbPath + '-wal')) fs.unlinkSync(dbPath + '-wal'); } catch {}
+    try { if (fs.existsSync(dbPath + '-shm')) fs.unlinkSync(dbPath + '-shm'); } catch {}
   });
 
   test('should save and retrieve order', () => {

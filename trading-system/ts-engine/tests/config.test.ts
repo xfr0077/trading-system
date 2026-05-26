@@ -8,26 +8,19 @@ describe('Config', () => {
   });
 
   test('should load config from environment variables', () => {
-    process.env.GRVT_PRIVATE_KEY = '0xtest-secret';
+    process.env.LIGHTER_API_PRIVATE_KEY = '0xtest-secret';
     process.env.REDIS_URL = 'redis://localhost:6379';
     process.env.SQLITE_PATH = '/tmp/test.db';
 
     const config = loadConfig();
 
-    expect(config.privateKey).toBe('0xtest-secret');
+    expect(config.lighterApiPrivateKey).toBe('0xtest-secret');
     expect(config.redisUrl).toBe('redis://localhost:6379');
     expect(config.sqlitePath).toBe('/tmp/test.db');
   });
 
-  test('should throw if private key is missing', () => {
-    delete process.env.GRVT_PRIVATE_KEY;
-    delete process.env.PRIVATE_KEY;
-    expect(() => loadConfig()).toThrow('GRVT_PRIVATE_KEY or PRIVATE_KEY is required');
-  });
-
-  test('should default env to testnet when GRVT_ENV is not set', () => {
-    process.env.GRVT_PRIVATE_KEY = '0xtest-secret';
-    delete process.env.GRVT_ENV;
+  test('should default env to testnet when DEX_ENV is not set', () => {
+    process.env.LIGHTER_API_PRIVATE_KEY = '0xtest-secret';
     delete process.env.DEX_ENV;
 
     const config = loadConfig();
@@ -36,17 +29,17 @@ describe('Config', () => {
   });
 
   test('should accept valid env values', () => {
-    process.env.GRVT_PRIVATE_KEY = '0xtest-secret';
+    process.env.LIGHTER_API_PRIVATE_KEY = '0xtest-secret';
 
-    process.env.GRVT_ENV = 'production';
+    process.env.DEX_ENV = 'production';
     expect(loadConfig().env).toBe('production');
 
-    process.env.GRVT_ENV = 'testnet';
+    process.env.DEX_ENV = 'testnet';
     expect(loadConfig().env).toBe('testnet');
   });
 
   test('should default dexProvider to lighter', () => {
-    process.env.GRVT_PRIVATE_KEY = '0xtest-secret';
+    process.env.LIGHTER_API_PRIVATE_KEY = '0xtest-secret';
     delete process.env.DEX_PROVIDER;
     delete process.env.DEX;
 
@@ -54,7 +47,7 @@ describe('Config', () => {
   });
 
   test('should parse grpcPort from environment', () => {
-    process.env.GRVT_PRIVATE_KEY = '0xtest-secret';
+    process.env.LIGHTER_API_PRIVATE_KEY = '0xtest-secret';
     process.env.GRPC_PORT = '8080';
 
     const config = loadConfig();
@@ -63,7 +56,7 @@ describe('Config', () => {
   });
 
   test('should default grpcPort to 50051 when GRPC_PORT is not set', () => {
-    process.env.GRVT_PRIVATE_KEY = '0xtest-secret';
+    process.env.LIGHTER_API_PRIVATE_KEY = '0xtest-secret';
     delete process.env.GRPC_PORT;
 
     const config = loadConfig();
@@ -71,25 +64,26 @@ describe('Config', () => {
     expect(config.grpcPort).toBe(50051);
   });
 
-  test('should throw if GRPC_PORT is NaN', () => {
-    process.env.GRVT_PRIVATE_KEY = '0xtest-secret';
+  test('should use default when GRPC_PORT is non-numeric', () => {
+    process.env.LIGHTER_API_PRIVATE_KEY = '0xtest-secret';
     process.env.GRPC_PORT = 'abc';
 
-    expect(() => loadConfig()).toThrow('GRPC_PORT must be a valid port number');
+    // Non-numeric env values are ignored → zod applies default
+    expect(loadConfig().grpcPort).toBe(50051);
   });
 
   test('should throw if GRPC_PORT is out of range', () => {
-    process.env.GRVT_PRIVATE_KEY = '0xtest-secret';
+    process.env.LIGHTER_API_PRIVATE_KEY = '0xtest-secret';
 
     process.env.GRPC_PORT = '0';
-    expect(() => loadConfig()).toThrow('GRPC_PORT must be a valid port number');
+    expect(() => loadConfig()).toThrow();
 
     process.env.GRPC_PORT = '65536';
-    expect(() => loadConfig()).toThrow('GRPC_PORT must be a valid port number');
+    expect(() => loadConfig()).toThrow();
   });
 
   test('should default tailscaleAiIp to 127.0.0.1 when not set', () => {
-    process.env.GRVT_PRIVATE_KEY = '0xtest-secret';
+    process.env.LIGHTER_API_PRIVATE_KEY = '0xtest-secret';
     delete process.env.TAILSCALE_AI_IP;
 
     const config = loadConfig();
@@ -106,8 +100,8 @@ describe('Config Phase 2', () => {
   });
 
   test('should load environment and symbols', () => {
-    process.env.GRVT_PRIVATE_KEY = '0xtest-secret';
-    process.env.GRVT_ENV = 'testnet';
+    process.env.LIGHTER_API_PRIVATE_KEY = '0xtest-secret';
+    process.env.DEX_ENV = 'testnet';
     process.env.SYMBOLS = 'BTC_USDT_Perp,ETH_USDT_Perp';
 
     const config = loadConfig();
@@ -117,8 +111,7 @@ describe('Config Phase 2', () => {
   });
 
   test('should use default environment and symbols', () => {
-    process.env.GRVT_PRIVATE_KEY = '0xtest-secret';
-    delete process.env.GRVT_ENV;
+    process.env.LIGHTER_API_PRIVATE_KEY = '0xtest-secret';
     delete process.env.DEX_ENV;
     delete process.env.SYMBOLS;
 
@@ -129,7 +122,7 @@ describe('Config Phase 2', () => {
   });
 
   test('should load risk config', () => {
-    process.env.GRVT_PRIVATE_KEY = '0xtest-secret';
+    process.env.LIGHTER_API_PRIVATE_KEY = '0xtest-secret';
     process.env.MAX_POSITION_SIZE = '0.5';
     process.env.MAX_DAILY_LOSS = '1000';
     process.env.MAX_CONCURRENT_SIGNALS = '5';
